@@ -1,16 +1,15 @@
 # Settings overlay for the pipeline's `omp -p` runs only (daily.py passes --config <this file>).
 # Your global ~/.omp/agent/config.yml is untouched, so interactive omp keeps its own models.
 modelRoles:
-  default: muskapi2/gpt-6.1-terra
-  task: muskapi2/gpt-6-luna          # qualify/apply workpool subagents
+  default: muskapi2/gpt-6.1-terra                      # orchestrator
+  task: openrouter/deepseek/deepseek-v4.1-flash        # qualify/apply workpool subagents (drive the ATS forms)
 
 retry:
   enabled: true
-  maxRetries: 3                      # attempts after the first failure
-  baseDelayMs: 2000                  # exponential: 2 s, 4 s, 8 s ...
-  maxDelayMs: 30000                  # ... never waiting more than 30 s
+  maxRetries: 5                      # attempts after the first failure
+  baseDelayMs: 2000                  # exponential: 2 s, 4 s, 8 s, 16 s, 30 s (capped)
+  maxDelayMs: 30000
   modelFallback: true
   fallbackOn: any
-  fallbackChains:
-    default: [openrouter/deepseek/deepseek-v4.1-flash]
-    task: [openrouter/deepseek/deepseek-v4.1-flash]
+  fallbackChains:                    # orchestrator only; the task model deliberately has no backup
+    default: [anthropic/claude-sonnet-5-5]

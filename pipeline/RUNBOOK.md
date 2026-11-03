@@ -46,8 +46,8 @@ C:/tmp/jobharness/pipeline/
   config.json          query profile, caps, notification mode
   daily.py             the orchestrator (msvcrt lock, per-stage logging, digest on failure)
   omp-pipeline.yml     per-run omp settings overlay (daily.py passes `--config`): default model
-                       muskapi2/gpt-6.1-terra, task (workpool subagents) muskapi2/gpt-6-luna, retries max 3
-                       with exponential backoff capped at 30 s, fallback openrouter/deepseek/deepseek-v4.1-flash.
+                       muskapi2/gpt-6.1-terra (fallback anthropic/claude-sonnet-5-5), task (workpool subagents)
+                       openrouter/deepseek/deepseek-v4.1-flash with no fallback; retries max 5 with exponential backoff capped at 30 s.
                        Global ~/.omp config is not touched. Both prompts start with `orchestrate`.
   discover.py          BlitzAPI via treg → candidates (dedupe vs state.db decisions +
                        the history ledger); --results FILE filters a saved response offline
