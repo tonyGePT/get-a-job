@@ -22,18 +22,70 @@ Three kinds of author-specific assumptions exist:
 
 1. **Platform: Windows only, as shipped.** It has run daily only on Windows 11 with Python 3.13. Nothing here has been run on macOS or Linux, and `daily.py` will not even start there. See [Platform: Windows-only as shipped](#platform-windows-only-as-shipped).
 2. **Personal job goals:** title lists, blocklists, resume variants and routing rules are tuned to the author's target roles. See [What is tuned to the author](#what-is-tuned-to-the-author).
-3. **Vendor choices:** discovery uses a metered third-party gateway, receipts are read from Gmail, the agent runtime is `omp`, outreach uses the author's private TraceHire Worker. See [External services](#external-services).
+3. **Vendor choices:** discovery uses the treg gateway, receipts are read from Gmail, the agent runtime is `omp`, outreach uses the author's private TraceHire Worker. See [What is required and what is optional](#what-is-required-and-what-is-optional).
+
+## What is required and what is optional
+
+The human has three decisions to make. Everything else follows from them.
+
+| Decision | Options | Notes |
+|---|---|---|
+| **1. Which coding-agent CLI runs the daily qualify and apply passes?** | Keep `omp` (as shipped), or port to Claude Code, Codex, or any other headless agent harness | **`omp` is optional.** It is only the author's choice. Porting is small and mechanical; see [Using a different agent harness](#using-a-different-agent-harness-omp-is-optional). |
+| **2. Use a CAPTCHA-solving service?** | Yes (RapidAPI "Fast MultiSolver"), or No | **Optional.** With No, every CAPTCHA is escalated to the human instead of solved. See [CAPTCHA solver](#captcha-solver-optional). |
+| **3. Use treg for job discovery?** | Yes, or find a replacement | **Not optional in practice.** Discovery has no working substitute in this repo, and finding one is difficult. See [treg: required](#treg-required-and-hard-to-replace). |
+
+| Component | Status | Replaceable? |
+|---|---|---|
+| treg (BlitzAPI jobs search) | **Required** | Difficult, untested; see below |
+| A coding-agent CLI that can run a prompt headlessly, with bash and a browser | **Required (any one)** | Yes: `omp`, Claude Code, Codex, others |
+| A model login for that CLI (Claude or ChatGPT/Codex subscription, or API key) | **Required** | Yes, any provider the CLI supports |
+| Gmail through `gws` | Required for `verify.py`; otherwise applications stay `unverified` | Yes, rewrite `verify.py`'s mail calls |
+| CAPTCHA solver (RapidAPI) | Optional | Remove, or swap the service |
+| TraceHire outreach | Optional | Run with `--no-trace` |
+| Discord digest | Optional | The digest file is always written locally |
+
+## Using a different agent harness (`omp` is optional)
+
+> **🚩 FLAG FOR THE CODING AGENT READING THIS: if the human does not use `omp`, you must rewrite the parts listed in
+> this section before anything runs.** The Python is harness-agnostic; the two agent prompts, one function in
+> `daily.py`, one config file and two small side-uses are not. Ask the human which CLI they want, then port every row below.
+> `omp` is Oh My Pi ([github.com/can1357/oh-my-pi](https://github.com/can1357/oh-my-pi)), an open-source coding-agent harness.
+> Nothing about the pipeline's logic requires it. A Claude Code or Codex subscription (or any other harness) can do the same job.
+
+Find every touchpoint yourself with:
+
+```sh
+git grep -n -i -E "\bomp\b|\.omp|workpool|browser\.open|tab\.(fill|type|evaluate|press|uploadFile)|mcp\.json|\bscout\b|skill" -- pipeline
+```
+
+| # | Where | What it uses from omp | What to port it to |
+|---|---|---|---|
+| 1 | `pipeline/daily.py`, function `agent()` | Runs `omp -p --no-title --cwd <pipeline dir> --config omp-pipeline.yml <prompt text>`: a one-shot headless run whose output goes to the day's log. Failure is non-fatal (`required=False`) | The replacement CLI's headless invocation (for example `claude -p`, or `codex exec`; check the CLI's own `--help`, the author has not run either). Keep: prompt text as the task, working directory = `pipeline/`, no interactive prompts, no time limit, stdout to the log |
+| 2 | `pipeline/omp-pipeline.yml` | Per-run settings overlay: the author's model pins (`default` orchestrator, `task` subagents), a fallback model, retry count and exponential backoff | The replacement CLI's own config: choose models, retries and a fallback there, then delete this file and the `--config` argument |
+| 3 | `pipeline/prompts/qualify.md` | `workpool("task")` or `scout`: spawns one sub-agent per candidate in a single call, up to 8 in parallel | Your harness's sub-agent or parallel-task mechanism, or fan out in Python by launching N headless sessions. Parallelism is optional; serial runs are just slower |
+| 4 | `pipeline/prompts/apply.md` | `workpool("task", name="apply")` for parallel workers; the omp **browser tool**: `browser.open(name=..., app={...})`, `tab.fill`, `tab.type`, `tab.uploadFile`, `tab.press`, `tab.evaluate("<IIFE>")`; one named tab per application; bash with long timeouts | A browser-automation tool your harness can use (Playwright MCP, a Chrome DevTools MCP, a built-in computer/browser tool). Rewrite the "Method" and "CAPTCHAs" steps in that tool's vocabulary. Keep the rules: one isolated browser context per application, proof only from a confirmation page or email, escalate instead of guessing |
+| 5 | `pipeline/prompts/apply.md` and `qualify.md` | omp-specific wording such as "do not use a duplicate-safeguard skill" (an omp/user skill concept) | Delete or reword for your harness |
+| 6 | `pipeline/digest.py`, `agent_usage()` and `SESSIONS` | Reads omp's session files under `~/.omp/agent/sessions/...` to print today's tokens and cost in the digest header | Remove the function and its header line, or read your harness's usage logs. The digest works without it |
+| 7 | `pipeline/lib/captcha.py`, `MCP_JSON` | Reads the CAPTCHA service key from the `captcha-solver` entry in `~/.omp/agent/mcp.json` | Read it from an environment variable or a key file instead (only matters if you keep the CAPTCHA solver) |
+| 8 | Permissions | The author's unattended runs pass no approval flag to omp | Your CLI needs a non-interactive permission mode that lets it run bash and the browser tool without asking; set it in item 1 |
+
+**The contract any replacement must meet.** Python never talks to the agent; it only reads the files the agent leaves.
+So a port is correct when:
+
+- **qualify** writes one JSON part file per candidate to `state/verdicts/parts/<date>/` (shape: see "Per candidate" in `prompts/qualify.md`) and the job description text to `state/jd/<key>.txt`. `prepare.py` merges the parts.
+- **apply** writes `state/evidence/<key>.json` (and a `.png`) per application, with a status and proof. `verify.py` and `digest.py` read those and the Gmail receipts; the apply agent never writes `state.db` itself.
+- Both agents can run bash (for `python lib/captcha.py`, `python lib/notify.py`, `gws`), read local files, and, for apply only, drive a real browser.
+
+After porting, run Gates 6 and 7 below before trusting it. Update the [Repository map](#repository-map) and delete `omp-pipeline.yml` if it no longer applies.
 
 ## Two agents, two jobs (do not confuse them)
 
 | Role | What it does | Which tool |
 |---|---|---|
-| **Setup agent** | Reads this README once, adapts the code and config to you and your OS, interviews you for your facts. | Any coding agent: Claude Code, Codex, omp, Cursor... |
-| **Runtime agent** | Runs unattended every day: `omp -p` executes `pipeline/prompts/qualify.md` and `apply.md`. | [`omp`](https://github.com/can1357/oh-my-pi) (Oh My Pi), logged in to a Claude or ChatGPT/Codex subscription or an API key. |
+| **Setup agent** | Reads this README once, adapts the code and config to the human and their OS, interviews them for their facts. | Any coding agent: Claude Code, Codex, omp, Cursor... |
+| **Runtime agent** | Runs unattended every day: executes `pipeline/prompts/qualify.md` and `apply.md` | `omp` as shipped; any headless agent harness after a port |
 
-The prompts name omp-specific tools (`workpool`, a browser tab API with `tab.evaluate`, bash). Running the
-pipeline under a different runtime means rewriting those two prompts and the `agent()` function in
-`pipeline/daily.py`. Using a different agent *for setup only* needs nothing.
+Using a different agent *for setup only* needs nothing from this section.
 
 ## If you are an AI agent: bootstrap protocol
 
@@ -47,7 +99,10 @@ Work through these gates in order. Each has a check. Tell the human what a step 
 4. **Do not enable the apply stage until the human has reviewed qualify output.** First runs use `--no-apply`. Applications are real, sent in the human's name, and cannot be recalled.
 5. **Say what you could not verify.** If you port a code path to the human's OS, say whether you ran it.
 
-**Gate 0. Interview the human (no spend).** Ask for and record: OS, target roles and titles, locations and remote
+**Gate 0. Interview the human (no spend).** First put the [three decisions](#what-is-required-and-what-is-optional) to them
+in plain words: which coding-agent CLI will run the daily passes (keep `omp`, or Claude Code, Codex or another; if not `omp`,
+you will port it), whether they want a CAPTCHA-solving service (optional), and that treg is required and has no easy
+substitute. Then ask for and record: OS, target roles and titles, locations and remote
 rules, salary floor, companies or industries to exclude, work authorization, what they refuse to do on a form
 (cover letters, exact-salary fields, AI-attestations, account creation), and which accounts they have (Gmail?
 Discord? a Claude or ChatGPT subscription?).
@@ -58,12 +113,12 @@ Discord? a Claude or ChatGPT subscription?).
 |---|---|---|
 | Python 3.9+ (author uses 3.13) | all deterministic stages | python.org, `brew install python`, or your distro. Use `python3` where `python` is absent. |
 | `pip install -r requirements.txt` | `fpdf2` renders resume PDFs | in a venv if you like |
-| `omp` CLI | runtime agent | macOS/Linux: `curl -fsSL https://omp.sh/install \| sh`; Windows: `irm https://omp.sh/install.ps1 \| iex`; or `bun install -g @oh-my-pi/pi-coding-agent` |
-| An omp login | model access | `omp login anthropic` (Claude subscription) or `omp login openai-codex` (ChatGPT/Codex subscription); `omp models` lists what you can use |
+| A coding-agent CLI that can run a prompt headlessly, run bash and drive a browser | runtime agent. **Pick one; `omp` is optional** | `omp` as shipped: macOS/Linux `curl -fsSL https://omp.sh/install \| sh`; Windows `irm https://omp.sh/install.ps1 \| iex`; or `bun install -g @oh-my-pi/pi-coding-agent`. For any other CLI, install it and port the [touchpoints](#using-a-different-agent-harness-omp-is-optional) |
+| A model login for that CLI | model access | with `omp`: `omp login anthropic` (Claude subscription) or `omp login openai-codex` (ChatGPT/Codex subscription); `omp models` lists what you can use. Other CLIs: their own login |
 | Node.js + Google Workspace CLI `gws` (`@googleworkspace/cli`) | verify stage reads Gmail receipts; apply agent reads emailed security codes | `npm i -g @googleworkspace/cli`, then authenticate it to the Gmail account used on applications. **Gmail only**; for other mail providers replace `verify.py` |
-| A [treg](https://treg.to/?ref=anthonyxge19-8jtx5) account | `discover.py` gets job postings through treg's BlitzAPI search; this is the one stage with no free substitute here | sign up, add a little credit (a first discovery run costs cents), then `treg login` so `~/.treg/config.json` exists with `base_url`, `token`, `active_org`. The link is the author's referral link. |
+| A [treg](https://treg.to/?ref=anthonyxge19-8jtx5) account | **Required.** `discover.py` gets every job posting through treg's BlitzAPI search; see [treg: required](#treg-required-and-hard-to-replace) | sign up, add a little credit (a first discovery run costs cents), then `treg login` so `~/.treg/config.json` exists with `base_url`, `token`, `active_org`. The link is the author's referral link. |
 
-Check: `python --version`, `omp --version`, `omp models`, `~/.treg/config.json` exists, and a Gmail call through `gws` that returns JSON.
+Check: `python --version`, your agent CLI's version command (`omp --version` if using omp), `~/.treg/config.json` exists, and a Gmail call through `gws` that returns JSON.
 
 Subscription logins are meant for interactive use; this pipeline drives them unattended and can burn a lot of
 quota. Read your provider's terms on automated use before relying on it, and prefer an API key if in doubt.
@@ -83,7 +138,7 @@ quota. Read your provider's terms on automated use before relying on it, and pre
 
 **Gate 3. Adapt the code to the human and their OS.** Walk the [tuned-to-the-author table](#what-is-tuned-to-the-author)
 and the [Windows-only list](#platform-windows-only-as-shipped), confirm each item with the human, and edit. Mandatory for everyone:
-the absolute paths in `config.json` and the two prompts, the model pins in `omp-pipeline.yml`, `query.titles`/`searches`,
+the absolute paths in `config.json` and the two prompts, the agent harness port if not `omp` (or the model pins in `omp-pipeline.yml` if it is), `query.titles`/`searches`,
 the regexes in `discover.py`, `VARIANTS`/`decide_variant()`, the Gmail check in `resume_tailor.py`, and the escalation list
 in `prompts/apply.md`. Everyone not on Windows also ports the lock, the scheduler and the paths.
 
@@ -243,16 +298,61 @@ Change each of these for your goals. None of it is a bug; it is the author's pre
 | `pipeline/trace.py` | talks to the author's private TraceHire Cloudflare Worker, which is not published | skip with `--no-trace`, or write your own |
 | `pipeline/lib/captcha.py` | calls the RapidAPI "Fast MultiSolver" service, reading its key from the `captcha-solver` entry in `~/.omp/agent/mcp.json` | optional; remove or replace. Solving CAPTCHAs may violate some sites' terms, your call |
 
-## External services
+## treg: required, and hard to replace
+
+**Decision for the human: the pipeline needs treg. There is no substitute in this repo, and the author expects finding one to be difficult.**
+Get an account through the author's referral link: <https://treg.to/?ref=anthonyxge19-8jtx5>.
+
+**What it is for.** treg is a metered gateway to many data APIs. This pipeline uses exactly one call: BlitzAPI's jobs search,
+`POST <base_url>/call/blitzapi.jobs.search`, sent by `call_treg()` in `pipeline/discover.py` with the credentials `treg login` writes to
+`~/.treg/config.json` (`base_url`, `token`, `active_org`). It is the **only source of postings** for the whole pipeline: `discover`
+turns the response into `state/candidates-latest.json`, and qualify, prepare, apply, verify and digest all start from that file.
+With no discovery there is nothing to qualify. (TraceHire, the optional outreach stage, also runs on treg's tool routing, but you
+can skip it.)
+
+**Why it is not optional.** The search is structured, not a scraper. `build_payloads()` in `discover.py` relies on all of these being
+filterable server-side, and the dedupe, agency and location rules assume them:
+
+- job title keywords, country, and city lists;
+- `work_arrangement` (Remote Solely / Remote OK / Hybrid / On-site);
+- `date_posted.last_days`, which the author runs as a rolling 3-day window because postings reach the index a day or more late;
+- company flags: `is_agency`, and company headquarters city (used for exclusions);
+- cursor paging (`max_results`, `cursor`, `total_results`), and a per-call cost header (`x-treg-cost-micro`) that the run logs.
+
+**Why a replacement will be difficult.** You need a source of fresh, de-duplicated job postings that carries employer, work
+arrangement, posting date and an agency flag, that you may legally query unattended every day, and that returns the employer's own
+application link or enough to find it. Raw job-board scraping tends to violate the boards' terms and gets blocked; most free feeds
+lack structured remote/hybrid and agency fields. The author has **not** tried to replace it, so this is an assessment, not a
+tested result.
+
+**If you must replace it anyway.** Write a function that produces the same candidate records and swap it in for `call_treg()` /
+`fetch_all()`: `{"candidates": [{url, company, title, posted, location, ai_summary}, ...]}` in `state/candidates-latest.json`, while
+keeping the rest of `discover.py` (title and agency filters, `dropped-<date>.json`, dedupe against `state.db`). For a manual stopgap,
+`python pipeline/discover.py --results FILE` runs the filters and dedupe over a saved response instead of calling treg.
+
+## CAPTCHA solver (optional)
+
+**Decision for the human: use it or not. The pipeline works without it.** It is the RapidAPI "Fast MultiSolver" service
+(`fast-multisolver.p.rapidapi.com`), called by `pipeline/lib/captcha.py` for token CAPTCHAs only: reCAPTCHA v2 and v3, hCaptcha,
+Cloudflare Turnstile and CaptchaFox. Image and slider challenges are never solved. It needs a RapidAPI subscription to that API, and
+`captcha.py` reads the key from the `captcha-solver` entry in `~/.omp/agent/mcp.json` (see [touchpoint 7](#using-a-different-agent-harness-omp-is-optional) to change that).
+
+- **To use it:** subscribe on RapidAPI, put the key where `captcha.py` reads it, and keep `limits.max_captcha_solves_per_day`
+  (default 10) as your spending cap. As shipped, token injection into a live ATS form is **unproven end to end**.
+- **To skip it (recommended for a first run):** delete `pipeline/lib/captcha.py`, remove `max_captcha_solves_per_day` from `config.json`,
+  and in `pipeline/prompts/apply.md` replace the whole "CAPTCHAs" section with one rule: *any CAPTCHA is an escalation*; write the evidence JSON
+  with status `escalated` and a `blocking_question` starting "CAPTCHA", exactly as the prompt already does for unsolvable ones.
+  The human then finishes those applications by hand from the digest.
+- Automated CAPTCHA solving may violate some sites' terms of use. That is the human's call, not the agent's.
+
+## Other services
 
 | Service | Used for | Required? | Cost | How to replace |
 |---|---|---|---|---|
-| [treg](https://treg.to/?ref=anthonyxge19-8jtx5) gateway (BlitzAPI jobs search) | `discover.py` | yes, unless replaced | about $0.0005 per returned posting; credentials in `~/.treg/config.json` (`base_url`, `token`, `active_org`, created by `treg login`) | write any source that produces `state/candidates-latest.json` as `{"candidates": [{url, company, title, posted, location, ai_summary}, ...]}` and swap it into `call_treg` / `main` in `discover.py` |
-| Claude or ChatGPT/Codex subscription, or API key, via `omp` | qualify and apply | yes | your plan quota or token spend | `omp login <provider>` |
+| A model login for your agent CLI (Claude or ChatGPT/Codex subscription, or API key) | qualify and apply | yes | your plan quota or token spend | the CLI's own login (`omp login <provider>` for omp) |
 | Gmail through `gws` | verify receipts, emailed security codes during apply | needed for `verify.py`; otherwise every application stays `unverified` | free | replace `verify.py`'s mail functions |
 | Discord bot or webhook | digest and unsolved-CAPTCHA alerts | no | free | `notify.py` reports "not configured" and the run continues |
 | TraceHire | outreach drafts to hiring contacts | no | metered, see RUNBOOK | run with `--no-trace` |
-| CAPTCHA solver | token CAPTCHAs during apply | no | metered | see table above |
 
 ## Known gaps and gotchas
 
@@ -261,8 +361,8 @@ Change each of these for your goals. None of it is a bug; it is the author's pre
 - Workday-style flows that force account creation record the generated password **in plaintext** in `state/evidence/<key>.json`. Keep `state/` private and encrypted at rest, or forbid account creation in `profile/apply_rules.md`.
 - `ledger.py check` treats today's own `APPLY` verdict rows as plausible duplicates. `apply.md` tells the apply agent not to run it on a prepared queue for that reason; do not remove that instruction.
 - The qualify agent writes per-candidate verdict part files and Python merges them. If you change the qualify prompt, keep that contract or the merge finds nothing.
-- With no timeouts, a stuck `omp` blocks the next day's run (the lock stays held). Kill the stuck process; `watchdog.py` tells you.
-- Model providers sometimes congest; `omp-pipeline.yml` configures retries with exponential backoff and an orchestrator fallback model.
+- With no timeouts, a stuck agent process (`omp` or your replacement) blocks the next day's run (the lock stays held). Kill the stuck process; `watchdog.py` tells you.
+- Model providers sometimes congest; as shipped `omp-pipeline.yml` configures retries with exponential backoff and an orchestrator fallback model. A different harness needs the equivalent in its own config.
 - Never treat the agent's claim of success as proof. `verify.py` reading a confirmation email is the ground truth, and the digest separates `APPLIED` from `UNVERIFIED`.
 - `state/` contains job descriptions, evidence screenshots, receipts and possibly passwords. The allowlist `.gitignore` keeps it out of git; do not widen it.
 
