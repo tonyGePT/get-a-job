@@ -42,6 +42,7 @@ def decide_variant(title, jd_text):
 
 def main():
     day = S.TODAY
+    S.merge_verdict_parts(day)
     verdicts = S.read_json(S.path("verdicts", "%s.json" % day), None)
     if verdicts is None:
         raise SystemExit("no verdicts file for %s" % day)

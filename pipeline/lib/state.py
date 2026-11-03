@@ -483,6 +483,42 @@ def receipt_subjects_by_key(conn):
 # ingest: agent-written artefacts -> database
 # ---------------------------------------------------------------------------
 
+def merge_verdict_parts(day=None):
+    """Build state/verdicts/<day>.json from the per-candidate part files the qualify workers wrote.
+
+    Workers write one verdict per candidate to verdicts/parts/<day>/<key>.json (older runs also left
+    verdicts/parts/<day>-<id>.json). The final file is assembled here, in Python, so a qualify agent
+    that never gets round to merging (or is killed by the stage timeout) cannot lose a day's
+    verdicts. The file is rebuilt only when it is missing or older than its newest part, so a
+    hand-edited verdicts file is never overwritten. Returns the number of verdicts merged (0 = left alone).
+    """
+    import glob
+    day = day or TODAY
+    parts = glob.glob(path("verdicts", "parts", day, "*.json")) + \
+        glob.glob(path("verdicts", "parts", "%s-*.json" % day))
+    if not parts:
+        return 0
+    final = path("verdicts", "%s.json" % day)
+    newest = max(os.path.getmtime(p) for p in parts)
+    if os.path.exists(final) and os.path.getmtime(final) >= newest:
+        return 0
+    by_url = {}
+    for p in sorted(parts, key=os.path.getmtime):
+        try:
+            with open(p, encoding="utf-8") as fh:
+                doc = json.load(fh)
+        except (OSError, ValueError):
+            continue
+        items = doc if isinstance(doc, list) else doc.get("items") if isinstance(doc, dict) and "items" in doc \
+            else [doc]
+        for it in items:
+            if isinstance(it, dict) and it.get("verdict") and (it.get("url") or it.get("apply_url")):
+                by_url[norm_url(it.get("url") or it.get("apply_url"))] = it   # later part wins
+    if not by_url:
+        return 0
+    write_json(final, {"generated": now(), "merged_from_parts": len(parts), "items": list(by_url.values())})
+    return len(by_url)
+
 def ingest_verdicts(day=None, conn=None):
     """Store today's qualification verdicts on their postings.
 
@@ -492,6 +528,7 @@ def ingest_verdicts(day=None, conn=None):
     stay eligible instead of being lost.
     """
     day = day or TODAY
+    merge_verdict_parts(day)
     doc = read_json(path("verdicts", "%s.json" % day), None)
     if doc is None:
         return 0

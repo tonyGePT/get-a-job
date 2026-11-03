@@ -22,20 +22,21 @@ You are qualifying today's job candidates for the candidate whose playbook and a
 5. Apply the location rule from the rules file; a role that requires living somewhere the rules do not allow is a SKIP even if LinkedIn says "remote".
 
 ## Output
-Write `state/verdicts/<today>.json` (today = `date +%F`) as:
+Each worker writes ITS OWN candidate's verdict, as soon as it has decided, to `state/verdicts/parts/<today>/<key>.json` (today = `date +%F`): one JSON object per file, in this shape:
 
 ```json
-{"generated": "<iso>", "items": [
- {"key": "", "company": "", "title": "", "url": "<linkedin url>",
-  "apply_url": "", "ats": "greenhouse|ashby|lever|workable|gem|jazzhr|teamtailor|workday|other|none",
-  "verdict": "APPLY|SKIP|ESCALATE", "reason": "<=25 words",
-  "hard_blockers": [], "location": "", "remote": "remote-us|hybrid|on-site|unknown",
-  "salary": null, "jd_file": "C:/tmp/jobharness/pipeline/state/jd/<key>.txt"}
-]}
+{"key": "", "company": "", "title": "", "url": "<linkedin url>",
+ "apply_url": "", "ats": "greenhouse|ashby|lever|workable|gem|jazzhr|teamtailor|workday|other|none",
+ "verdict": "APPLY|SKIP|ESCALATE", "reason": "<=25 words",
+ "hard_blockers": [], "location": "", "remote": "remote-us|hybrid|on-site|unknown",
+ "salary": null, "jd_file": "C:/tmp/jobharness/pipeline/state/jd/<key>.txt"}
 ```
+
+Do NOT write `state/verdicts/<today>.json` yourself: `prepare.py` assembles it from the part files (a hand-written file, if one exists and is newer than every part, is used as is).
 
 ## Rules
 - Use `workpool("task")` (or `scout`) with one item per candidate, all in ONE call so candidates are qualified in parallel (concurrency is capped at 8; excess items queue) — never read candidates one after another.
 - Never invent a JD, an apply URL, a salary, or a blocker. If the page cannot be read, verdict `ESCALATE` with reason "unreadable posting".
 - Do not apply to anything, do not write to `state/state.db` or the `history` ledger, do not send email.
 - Print a one-line summary per candidate when done.
+- ONE pass per candidate. Do not start verification, correction or second-opinion rounds over finished verdicts, do not re-read postings to second-guess a worker, and do not merge anything: when every worker has returned, print the summary and stop. (The pipeline merges the part files itself; on 2026-11-03 an endless "final corrections" loop ate the whole 3 h stage timeout after every verdict was already written.)
