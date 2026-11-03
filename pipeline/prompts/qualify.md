@@ -19,7 +19,7 @@ You are qualifying today's job candidates for the candidate whose playbook and a
    - `APPLY` — an employer ATS page exists and no hard rule is violated.
    - `SKIP` — a hard skip rule in the rules file applies.
    - `ESCALATE` — the rules file says the decision belongs to the candidate (exact-salary demand, legal representation, mandatory cover letter, paid assessment, AI-attestation, ...).
-5. Apply the location rule from the rules file; a role that requires living somewhere the rules do not allow is a SKIP even if LinkedIn says "remote".
+5. Apply the candidate's location rule from the private rules file: US-remote roles are acceptable regardless of employer headquarters unless the posting explicitly restricts where the candidate may reside/work. For hybrid/on-site roles, follow the home-area rule in the file.
 
 ## Output
 Each worker writes ITS OWN candidate's verdict, as soon as it has decided, to `state/verdicts/parts/<today>/<key>.json` (today = `date +%F`): one JSON object per file, in this shape:

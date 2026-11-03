@@ -55,8 +55,8 @@ C:/tmp/jobharness/pipeline/
                        (also the first stage that stores verdicts in state.db)
   verify.py            Gmail receipts → submitted/unverified (append-only, one query/run)
   trace.py             start | poll | retry [--dry-run] | status (db-deduped, daily cap)
-  ledger.py            check | add | list | outreach | resume-change: duplicate review and hand-run entries
-                       against state.db (replaces application_log.md)
+  ledger.py            check | add | list | outreach | lead | resume-change: duplicate review and hand-run entries
+                       against state.db (replaces application_log.md and outreach_leads.md)
   digest.py            state → state/digest-<date>.md, posted to the Discord channel via lib/notify.py (no
                        email). Decisions grouped by final outcome, SKIPPED last; one line each: company, role,
                        location, salary. Header carries today's omp tokens/cost, summed from the session files
@@ -74,7 +74,7 @@ C:/tmp/jobharness/pipeline/
   prompts/qualify.md   agent contract: per-candidate verdicts + ATS URL + JD text
   prompts/apply.md     agent contract: submit queue, prove it, escalate the rest
   state/
-    state.db           postings, runs, applications, receipts  ← the only state that matters
+    state.db           postings, runs, applications, receipts, history, outreach, leads, resume_changes, log_notes  ← the only state that matters
     candidates-latest.json, dropped-<date>.json   what was kept and why the rest was not
     verdicts/<date>.json, apply-queue.json
     evidence/<key>.{json,png}   per-application proof (the apply agent writes these)
@@ -163,8 +163,7 @@ A paused readout: `Last Result 0` is success; `JobHuntWatchdog` writes
   hybrid/on-site roles in the configured home-area cities (BlitzAPI tags most hybrid jobs On-site). Rolling
   3-day window, because postings land in the index a day or more late and a 1-day window caught ~1/10.
   `is_agency: false` — `true` means *only* agencies (the 10-27..10-29 runs had it inverted).
-  Companies headquartered in `query.exclude_hq_cities` are excluded server-side
-  (`company.hq.city.exclude`) and again by the qualify prompt (companies with no HQ on file).
+- `query.exclude_hq_cities` remains available for the candidate's private cultural-fit exclusions; those values stay in local `config.json` and are not copied into tracked files. Headquarters do not disqualify US-remote roles except for explicitly configured private exclusions; LA hybrid/on-site search uses configured home-area cities.
   Same-role multi-city reposts are collapsed before the 3+-roles board check.
 - `msvcrt` lock on `.lock` (held by `daily.py`): a hung run can never stack with the next one.
 - Every excluded posting is written to `dropped-<date>.json` with a reason — no silent filtering.

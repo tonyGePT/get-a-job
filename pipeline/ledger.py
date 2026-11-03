@@ -15,6 +15,9 @@ outcomes are already in `postings` / `applications`; `check` looks in all of the
   python ledger.py list [--days N] [--action A] [--company SUBSTR] [--limit N]
   python ledger.py outreach add --company C [--recipient R] [--role R] [--verdict V] [--channel X] [--notes N]
   python ledger.py outreach list [--company SUBSTR]
+  python ledger.py lead add --company C [--person P] [--signal TEXT] [--signal-date D] [--source URL]
+        [--fit TEXT] [--status S]     soft-signal hiring leads (not applications)
+  python ledger.py lead list [--company SUBSTR]
   python ledger.py resume-change add --resume ID --what TEXT --why TEXT
   python ledger.py resume-change list
 """
@@ -144,6 +147,22 @@ def cmd_resume_change(a):
     return 0
 
 
+def cmd_lead(a):
+    conn = S.db()
+    if a.sub == "add":
+        with S.tx(conn):
+            conn.execute("INSERT INTO leads (date_logged, signal_date, person, company, signal, source, fit, status) "
+                         "VALUES (?,?,?,?,?,?,?,?)",
+                         (a.date or S.TODAY, a.signal_date, a.person, a.company, a.signal, a.source, a.fit,
+                          a.status))
+        print("lead row added")
+        return 0
+    where, params = ("WHERE company LIKE ?", ["%" + a.company + "%"]) if a.company else ("", [])
+    for r in conn.execute("SELECT * FROM leads %s ORDER BY date_logged DESC, id DESC" % where, params):
+        print(line(r["date_logged"], r["company"], r["person"], r["signal"], r["status"], r["fit"], r["source"]))
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -193,9 +212,23 @@ def main():
     c.add_argument("--date")
     c.set_defaults(fn=cmd_resume_change)
 
+    c = sub.add_parser("lead")
+    c.add_argument("sub", choices=("add", "list"))
+    c.add_argument("--company")
+    c.add_argument("--person")
+    c.add_argument("--signal")
+    c.add_argument("--signal-date")
+    c.add_argument("--source")
+    c.add_argument("--fit")
+    c.add_argument("--status")
+    c.add_argument("--date")
+    c.set_defaults(fn=cmd_lead)
+
     a = ap.parse_args()
     if a.cmd == "outreach" and a.sub == "add" and not a.company:
         ap.error("outreach add needs --company")
+    if a.cmd == "lead" and a.sub == "add" and not a.company:
+        ap.error("lead add needs --company")
     if a.cmd == "resume-change" and a.sub == "add" and not (a.resume and a.what and a.why):
         ap.error("resume-change add needs --resume, --what and --why")
     return a.fn(a)

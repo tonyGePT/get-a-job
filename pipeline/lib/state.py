@@ -158,6 +158,18 @@ CREATE TABLE IF NOT EXISTS resume_changes (
   why         TEXT
 );
 
+CREATE TABLE IF NOT EXISTS leads (          -- soft-signal hiring leads (replaced outreach_leads.md); not applications
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  date_logged   TEXT,
+  signal_date   TEXT,
+  person        TEXT,
+  company       TEXT NOT NULL DEFAULT '',
+  signal        TEXT,                    -- role / what the signal says
+  source        TEXT,                    -- public URL
+  fit           TEXT,                    -- fit / constraints
+  status        TEXT                     -- e.g. "Research only", "Candidate lead", "Closed/expired"
+);
+
 CREATE TABLE IF NOT EXISTS log_notes (     -- free-text sections of the old log, kept verbatim
   id       INTEGER PRIMARY KEY AUTOINCREMENT,
   heading  TEXT,
