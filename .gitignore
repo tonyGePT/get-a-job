@@ -1,0 +1,25 @@
+# Allowlist: everything is private unless listed below. Nothing personal is ever published.
+/*
+!/.gitignore
+!/README.md
+!/requirements.txt
+!/resume_tailor.py
+!/keyword_coverage.py
+
+!/pipeline/
+/pipeline/*
+!/pipeline/*.py
+!/pipeline/*.bat
+!/pipeline/*.vbs
+!/pipeline/RUNBOOK.md
+!/pipeline/omp-pipeline.yml
+!/pipeline/config.example.json
+!/pipeline/lib/
+!/pipeline/prompts/
+
+# even inside allowed folders
+__pycache__/
+*.pyc
+*.db
+*.db-wal
+*.db-shm

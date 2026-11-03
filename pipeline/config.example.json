@@ -1,0 +1,53 @@
+{
+  "harness": "C:/path/to/jobharness",
+  "state_dir": "C:/path/to/jobharness/pipeline/state",
+  "resume_prefix": "Resume",
+  "tracehire": {
+    "base": "https://your-tracehire-worker.example.workers.dev",
+    "key_file": "C:/path/to/jobharness/tracehire_api_key.txt",
+    "stagger_seconds": 40,
+    "poll_seconds": 45,
+    "poll_timeout_minutes": 30
+  },
+  "query": {
+    "titles": [
+      "Solutions Engineer",
+      "Implementation Engineer",
+      "Integration Engineer",
+      "Automation Engineer"
+    ],
+    "country_code": ["US"],
+    "searches": [
+      {
+        "name": "us-remote",
+        "work_arrangement": ["Remote Solely", "Remote OK"]
+      },
+      {
+        "name": "local",
+        "work_arrangement": ["Hybrid", "On-site"],
+        "cities": ["Your City"]
+      }
+    ],
+    "exclude_hq_cities": [],
+    "date_posted_days": 3,
+    "is_agency": false,
+    "page_size": 50,
+    "max_pages_per_search": 12
+  },
+  "limits": {
+    "max_candidates": 500,
+    "max_applications_per_day": 50,
+    "max_trace_runs_per_day": 10,
+    "max_captcha_solves_per_day": 10
+  },
+  "notify": {
+    "email": "you@example.com",
+    "discord_webhook_file": "C:/path/to/jobharness/pipeline/discord_webhook.txt",
+    "discord_channel_id": "",
+    "discord_bot_token_file": "C:/path/to/jobharness/pipeline/discord_bot_token.txt"
+  },
+  "gws": {
+    "node": "C:/Program Files/nodejs/node.exe",
+    "cli": "C:/path/to/node_modules/@googleworkspace/cli/run-gws.js"
+  }
+}
