@@ -28,8 +28,6 @@ sys.path.insert(0, os.path.join(ROOT, "lib"))
 import state as S  # noqa: E402
 
 PY = sys.executable
-QUALIFY_TIMEOUT = 3 * 3600
-APPLY_TIMEOUT = 4 * 3600
 
 
 class Failed(Exception):
@@ -49,13 +47,10 @@ def stage(name):
         log("heartbeat failed: %s" % e)
 
 
-def run(args, timeout=None, required=True, label=None):
+def run(args, required=True, label=None):
     """Run a child with its output in our log. Returns True on exit 0."""
-    try:
-        rc = subprocess.run(args, cwd=ROOT, stdout=sys.stdout, stderr=subprocess.STDOUT,
-                            stdin=subprocess.DEVNULL, timeout=timeout).returncode
-    except subprocess.TimeoutExpired:
-        rc = "timeout after %ss" % timeout
+    rc = subprocess.run(args, cwd=ROOT, stdout=sys.stdout, stderr=subprocess.STDOUT,
+                        stdin=subprocess.DEVNULL).returncode
     if rc == 0:
         return True
     if required:
@@ -68,13 +63,14 @@ def script(name, *args, **kw):
     return run([PY, os.path.join(ROOT, name)] + list(args), **kw)
 
 
-def agent(prompt_file, timeout, label):
-    """Run one omp agent pass. --config overlays omp-pipeline.yml (models, retries, fallback)
-    for this run only; the global omp config is not touched."""
+def agent(prompt_file, label):
+    """Run one omp agent pass, with NO time limit (removed 2026-11-03: the model providers congest
+    during Asian business hours, and a killed stage lost a whole day's verdicts). --config overlays
+    omp-pipeline.yml (models, retries, fallback) for this run only; the global omp config is not touched."""
     prompt = open(os.path.join(ROOT, "prompts", prompt_file), encoding="utf-8").read()
     return run(["omp", "-p", "--no-title", "--cwd", ROOT,
                 "--config", os.path.join(ROOT, "omp-pipeline.yml"), prompt],
-               timeout=timeout, required=False, label=label)
+               required=False, label=label)
 
 
 def pipeline(args):
@@ -89,7 +85,7 @@ def pipeline(args):
         log("nothing new today: skipping qualify/prepare/apply, reconciling the rest")
     else:
         stage("qualify (%d candidates)" % new)
-        agent("qualify.md", QUALIFY_TIMEOUT, "qualify stage")
+        agent("qualify.md", "qualify stage")
         stage("prepare (tailored resumes)")
         prepared = script("prepare.py", required=False, label="prepare")
         if not prepared:
@@ -98,7 +94,7 @@ def pipeline(args):
             log("--no-apply: skipping form submission")
         else:
             stage("apply")
-            agent("apply.md", APPLY_TIMEOUT, "apply stage")
+            agent("apply.md", "apply stage")
             script(os.path.join("lib", "notify.py"), "scan", required=False, label="captcha notify")
 
     stage("verify receipts")

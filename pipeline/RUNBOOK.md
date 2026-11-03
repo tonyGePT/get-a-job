@@ -133,8 +133,13 @@ Two Windows tasks, both hidden (wscript wrapper, no console flash):
 
 | Task | Trigger | Command |
 |---|---|---|
-| `JobHuntDaily` | daily 03:00 | `wscript.exe C:\tmp\jobharness\pipeline\daily-hidden.vbs` |
+| `JobHuntDaily` | daily 08:00 (moved from 03:00 on 2026-11-03) | `wscript.exe C:\tmp\jobharness\pipeline\daily-hidden.vbs` |
 | `JobHuntWatchdog` | every 120 min | `wscript.exe C:\tmp\jobharness\pipeline\watchdog-hidden.vbs` |
+
+**No stage timeouts (2026-11-03).** The qualify and apply agents run until they finish. The model providers congest
+during Asian business hours (roughly midnight to 05:00 PT), which is why the run starts at 08:00 PT. The cost of no
+limit: a genuinely hung agent blocks the run, and the next day's run then exits at the `.lock` check ("another run
+holds the lock") instead of stacking. `watchdog.py` still raises an ALERT after 26 h without a heartbeat.
 
 The wrappers run `daily.bat` / `watchdog.bat`, which call `C:\Python313\python.exe`
 directly. Re-register with `C:\tmp\jobharness\pipeline\register-tasks.bat` (idempotent, `/F` overwrites).
