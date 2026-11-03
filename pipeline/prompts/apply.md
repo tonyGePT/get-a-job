@@ -11,7 +11,7 @@ Submit the applications queued in `state/apply-queue.json`. Nothing else.
 
 ## Method
 - This is the prepared queue from today's qualify stage. Do NOT run `ledger.py check`, do NOT use a duplicate-safeguard skill, and do NOT treat today's own `postings` / `verdict=APPLY` row as a prior application. The queue has already been deduped by the pipeline. Only skip for a real prior application (e.g. a confirmed `submitted` row in `state.db` / history) for the same requisition; if uncertain, inspect that prior status and compare ATS requisition URL, not just company/title.
-- Process queue entries strictly ONE AT A TIME in the current agent, completing and writing evidence for each before opening the next. Do NOT use `workpool` or launch subagents for applications: browser sessions share one active page, so parallel workers can navigate each other's forms and corrupt submissions.
+- `workpool("task", name="apply")`, one item per queue entry, all submitted in ONE call (omp caps parallel workers at 8). Each worker must use its own named tab `apply-<key>` via `browser.open(name="apply-<key>", ...)`; never share or reuse another worker's tab. Applications run in parallel, each with independent browser state.
 - Open with `browser.open(name="apply-<key>", url=<apply_url>, app={"relay": False, "tern": False})` (managed Chromium; the relay is not connected on this box).
 - Filling: `tab.fill` / `tab.type` for inputs, `tab.uploadFile(sel, resume_pdf)` for the hidden resume input, `tab.press("Escape", {"selector": sel})` to dismiss react-select menus, `tab.evaluate("<IIFE string>")` for anything multi-statement. `tab.evaluate` needs an IIFE, not a bare function.
 - Retry a rejected field ONCE after reading the red error text; never guess what the validator wanted.
