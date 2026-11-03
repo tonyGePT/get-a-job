@@ -12,7 +12,7 @@ Usage:
   python daily.py                  full run
   python daily.py --discover-only  cheap check, no LLM, no browser
   python daily.py --no-apply       everything except form submission
-  python daily.py --no-trace       skip TraceHire runs
+  python daily.py --no-trace       skip the optional private trace extension (pipeline/trace.py) even if installed
   python daily.py --days 3         override config.json query.date_posted_days
 """
 
@@ -100,13 +100,18 @@ def pipeline(args):
     stage("verify receipts")
     script("verify.py")
 
-    if not args.no_trace:
-        stage("tracehire start")
+    # Optional private extension: runs only if pipeline/trace.py exists AND config.json has a `tracehire` block.
+    # The public repo does not ship trace.py; without it these stages are skipped (one log line).
+    has_trace = os.path.exists(os.path.join(ROOT, "trace.py")) and bool(S.CONFIG.get("tracehire"))
+    if not has_trace:
+        log("trace extension not installed: skipping trace stages")
+    elif not args.no_trace:
+        stage("trace start")
         script("trace.py", "start", required=False, label="trace start")
-        stage("tracehire poll")
+        stage("trace poll")
         script("trace.py", "poll", required=False, label="trace poll")
-        # upstream extract failures are worth exactly one more attempt (cost-capped in trace.py)
-        stage("tracehire retry")
+        # one retry pass for transient failures (cost-capped inside the extension)
+        stage("trace retry")
         script("trace.py", "retry", required=False, label="trace retry")
 
     stage("digest")

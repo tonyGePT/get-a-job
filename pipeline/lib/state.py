@@ -58,7 +58,7 @@ CREATE INDEX IF NOT EXISTS postings_pair ON postings (company_key, title_key);
 CREATE INDEX IF NOT EXISTS postings_decided ON postings (decided_at);
 
 CREATE TABLE IF NOT EXISTS runs (
-  url_key         TEXT PRIMARY KEY,      -- one TraceHire run per posting URL, ever
+  url_key         TEXT PRIMARY KEY,      -- one extension run per posting URL, ever (private trace extension)
   company         TEXT NOT NULL DEFAULT '',
   title           TEXT NOT NULL DEFAULT '',
   url             TEXT NOT NULL DEFAULT '',

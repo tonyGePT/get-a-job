@@ -2,13 +2,6 @@
   "harness": "C:/path/to/jobharness",
   "state_dir": "C:/path/to/jobharness/pipeline/state",
   "resume_prefix": "Resume",
-  "tracehire": {
-    "base": "https://your-tracehire-worker.example.workers.dev",
-    "key_file": "C:/path/to/jobharness/tracehire_api_key.txt",
-    "stagger_seconds": 40,
-    "poll_seconds": 45,
-    "poll_timeout_minutes": 30
-  },
   "query": {
     "titles": [
       "Solutions Engineer",
@@ -37,7 +30,6 @@
   "limits": {
     "max_candidates": 500,
     "max_applications_per_day": 50,
-    "max_trace_runs_per_day": 10,
     "max_captcha_solves_per_day": 10
   },
   "notify": {

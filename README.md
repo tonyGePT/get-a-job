@@ -22,7 +22,7 @@ Three kinds of author-specific assumptions exist:
 
 1. **Platform: Windows only, as shipped.** It has run daily only on Windows 11 with Python 3.13. Nothing here has been run on macOS or Linux, and `daily.py` will not even start there. See [Platform: Windows-only as shipped](#platform-windows-only-as-shipped).
 2. **Personal job goals:** title lists, blocklists, resume variants and routing rules are tuned to the author's target roles. See [What is tuned to the author](#what-is-tuned-to-the-author).
-3. **Vendor choices:** discovery uses the treg gateway, receipts are read from Gmail, the agent runtime is `omp`, outreach uses the author's private TraceHire Worker. See [What is required and what is optional](#what-is-required-and-what-is-optional).
+3. **Vendor choices:** discovery uses the treg gateway, receipts are read from Gmail, and the agent runtime is `omp`. See [What is required and what is optional](#what-is-required-and-what-is-optional).
 
 ## What is required and what is optional
 
@@ -41,7 +41,7 @@ The human has three decisions to make. Everything else follows from them.
 | A model login for that CLI (Claude or ChatGPT/Codex subscription, or API key) | **Required** | Yes, any provider the CLI supports |
 | Gmail through `gws` | Required for `verify.py`; otherwise applications stay `unverified` | Yes, rewrite `verify.py`'s mail calls |
 | CAPTCHA solver (RapidAPI) | Optional | Remove, or swap the service |
-| TraceHire outreach | Optional | Run with `--no-trace` |
+| Private extension stage (`pipeline/trace.py`) | Not shipped | Absent in your clone; the pipeline skips it automatically. See [Extension hook](#extension-hook) |
 | Discord digest | Optional | The digest file is always written locally |
 
 ## Using a different agent harness (`omp` is optional)
@@ -154,11 +154,11 @@ python pipeline/watchdog.py                    # reports "no heartbeat file" bef
 (about $0.0005 per returned posting), uses no LLM and no browser. Read `pipeline/state/candidates-latest.json` and
 `pipeline/state/dropped-<date>.json` with the human. Tune the blocklists until both look right.
 
-**Gate 6. Qualify and tailor, no submissions.** `python pipeline/daily.py --no-apply --no-trace` spends model tokens on
+**Gate 6. Qualify and tailor, no submissions.** `python pipeline/daily.py --no-apply` spends model tokens on
 `qualify`, then renders resumes. Review `state/verdicts/<date>.json`, the PDFs in `resumes/`, and the digest in
 `state/digest-<date>.md` with the human. Every verdict reason should be one the human agrees with.
 
-**Gate 7. Supervised apply.** Set `limits.max_applications_per_day` to 1 to 3 and run `python pipeline/daily.py --no-trace`.
+**Gate 7. Supervised apply.** Set `limits.max_applications_per_day` to 1 to 3 and run `python pipeline/daily.py`.
 Watch `state/evidence/<key>.json` and the confirmation emails. Count an application as submitted only when `verify`
 shows a receipt. Raise the cap gradually.
 
@@ -181,7 +181,7 @@ the author's Windows ops log (`C:/` paths, Task Scheduler, dated incidents): **w
 | prepare | `prepare.py` + `resume_tailor.py` | routes each APPLY verdict to a resume variant, adds JD keywords you may truthfully claim, renders a PDF | `resumes/`, `state/apply-queue.json` |
 | apply | `omp -p` with `prompts/apply.md` | fills and submits forms in a browser, writes proof or an escalation | `state/evidence/<key>.{json,png}` |
 | verify | `verify.py` | matches Gmail receipts to applications; anything unproven is downgraded to `unverified` | `state.db` |
-| trace | `trace.py` | OPTIONAL: starts outreach drafts through TraceHire | `state.db` |
+| extension | `trace.py` (private, not published) | optional post-verify stage; skipped when the file is absent | `state.db` |
 | digest | `digest.py` | one markdown summary, optionally posted to Discord | `state/digest-<date>.md` |
 
 `state/state.db` (SQLite) is the source of truth. `python pipeline/ledger.py check|list|add|outreach|lead|resume-change`
@@ -201,11 +201,10 @@ timeouts**: a hung agent blocks that day's run until you kill it.
 | `resume_prefix` | PDF filename prefix, e.g. `Jane_Doe_Resume` gives `Jane_Doe_Resume_<key>.pdf` |
 | `query.titles`, `query.searches` | title keywords and the searches to run (remote, plus local hybrid/on-site by city) |
 | `query.exclude_hq_cities`, `date_posted_days`, `is_agency`, `page_size`, `max_pages_per_search` | filters and paging |
-| `limits.max_candidates`, `max_applications_per_day`, `max_trace_runs_per_day`, `max_captcha_solves_per_day` | hard caps. `max_applications_per_day` counts attempts queued, not confirmed submissions. The default 50 is high for a first run |
+| `limits.max_candidates`, `max_applications_per_day`, `max_captcha_solves_per_day` | hard caps. `max_applications_per_day` counts attempts queued, not confirmed submissions. The default 50 is high for a first run |
 | `notify.email` | **your** mailbox address; mail from yourself is excluded when matching receipts |
 | `notify.discord_*` | optional; without them the digest is only the local file |
 | `gws.node`, `gws.cli` | absolute path to `node` and to `@googleworkspace/cli/run-gws.js`. The author launches gws as `node run-gws.js` because the Windows `.cmd` shim mangles JSON arguments. On macOS/Linux change `verify.py` to call `gws` directly |
-| `tracehire` | read at import by `trace.py` (needs `base` and a `key_file` that exists). Without a TraceHire deployment run with `--no-trace`; otherwise the trace stages fail non-fatally on every run |
 
 Set `JOBHUNT_STATE=<dir>` to run any stage against a copy of `state/`.
 
@@ -275,8 +274,8 @@ Things to know on every OS:
 ### Scheduling
 
 Windows (as shipped): after the paths in the five launcher files are right, `register-tasks.bat` registers `JobHuntDaily` (08:00 daily)
-and `JobHuntWatchdog` (every 120 minutes); `schtasks /Query /TN JobHuntDaily /FO LIST /V` shows status. To skip TraceHire add
-`--no-trace` to the command in `daily.bat`. macOS/Linux: run `python3 pipeline/daily.py` once a day and
+and `JobHuntWatchdog` (every 120 minutes); `schtasks /Query /TN JobHuntDaily /FO LIST /V` shows status.
+macOS/Linux: run `python3 pipeline/daily.py` once a day and
 `python3 pipeline/watchdog.py --quiet` every couple of hours from cron or launchd, with `cwd` set to `pipeline/` and a `PATH` that includes `omp`,
 `node` and `gws`. These are not shipped and have never been run.
 
@@ -295,7 +294,7 @@ Change each of these for your goals. None of it is a bug; it is the author's pre
 | `pipeline/verify.py` `ATS_DOMAINS` and the Gmail query | recognised ATS senders and receipt-subject phrases | add your ATS domains; replace the Gmail calls entirely for another mail provider |
 | `pipeline/lib/state.py` schema | tables `history`, `outreach`, `resume_changes`, `log_notes`, `leads` exist because the author migrated a markdown log into them; harmless if unused | drop what you do not need |
 | `pipeline/lib/notify.py` | the Discord User-Agent string names the author's repository | your repo URL (Discord rejects the default urllib agent) |
-| `pipeline/trace.py` | talks to the author's private TraceHire Cloudflare Worker, which is not published | skip with `--no-trace`, or write your own |
+| `pipeline/trace.py` (not shipped) | the extension hook: `daily.py` runs it only if the file exists | nothing; see [Extension hook](#extension-hook) |
 | `pipeline/lib/captcha.py` | calls the RapidAPI "Fast MultiSolver" service, reading its key from the `captcha-solver` entry in `~/.omp/agent/mcp.json` | optional; remove or replace. Solving CAPTCHAs may violate some sites' terms, your call |
 
 ## treg: required, and hard to replace
@@ -307,8 +306,7 @@ Get an account through the author's referral link: <https://treg.to/?ref=anthony
 `POST <base_url>/call/blitzapi.jobs.search`, sent by `call_treg()` in `pipeline/discover.py` with the credentials `treg login` writes to
 `~/.treg/config.json` (`base_url`, `token`, `active_org`). It is the **only source of postings** for the whole pipeline: `discover`
 turns the response into `state/candidates-latest.json`, and qualify, prepare, apply, verify and digest all start from that file.
-With no discovery there is nothing to qualify. (TraceHire, the optional outreach stage, also runs on treg's tool routing, but you
-can skip it.)
+With no discovery there is nothing to qualify.
 
 **Why it is not optional.** The search is structured, not a scraper. `build_payloads()` in `discover.py` relies on all of these being
 filterable server-side, and the dedupe, agency and location rules assume them:
@@ -352,7 +350,6 @@ Cloudflare Turnstile and CaptchaFox. Image and slider challenges are never solve
 | A model login for your agent CLI (Claude or ChatGPT/Codex subscription, or API key) | qualify and apply | yes | your plan quota or token spend | the CLI's own login (`omp login <provider>` for omp) |
 | Gmail through `gws` | verify receipts, emailed security codes during apply | needed for `verify.py`; otherwise every application stays `unverified` | free | replace `verify.py`'s mail functions |
 | Discord bot or webhook | digest and unsolved-CAPTCHA alerts | no | free | `notify.py` reports "not configured" and the run continues |
-| TraceHire | outreach drafts to hiring contacts | no | metered, see RUNBOOK | run with `--no-trace` |
 
 ## Known gaps and gotchas
 
@@ -371,7 +368,7 @@ Cloudflare Turnstile and CaptchaFox. Image and slider challenges are never solve
 | Path | What |
 |---|---|
 | `pipeline/daily.py` | orchestrator: lock, stage order, digest on failure |
-| `pipeline/discover.py`, `prepare.py`, `verify.py`, `trace.py`, `digest.py` | one script per stage |
+| `pipeline/discover.py`, `prepare.py`, `verify.py`, `digest.py` | one script per stage |
 | `pipeline/ledger.py` | duplicate checks and hand-entered history against `state.db` |
 | `pipeline/watchdog.py` | silence detector |
 | `pipeline/*.bat`, `*.vbs` | Windows launchers and Task Scheduler registration |
@@ -381,8 +378,20 @@ Cloudflare Turnstile and CaptchaFox. Image and slider challenges are never solve
 | `pipeline/RUNBOOK.md` | the author's detailed ops notes (Windows-era) |
 | `resume_tailor.py`, `keyword_coverage.py` | resume tailoring engine and keyword-tier logic |
 
+## Extension hook
+
+`daily.py` has one optional extension point. After `verify`, if `pipeline/trace.py` exists **and** `config.json` has a `tracehire` block,
+it runs `trace.py start`, `trace.py poll` and `trace.py retry`; each is non-fatal. The author uses it for a private outreach tool
+that is not published, and `.gitignore` keeps that file out of the repo. In your clone the file does not exist, so the stage is skipped
+with one log line and you can ignore the hook.
+
+To add your own post-verify stage, drop a script at `pipeline/trace.py` (or edit the hook in `daily.py`). It may read
+`applications` where `status='submitted'` joined to `postings` in `state/state.db`, and may use the `runs` table and its helpers
+in `lib/state.py` (`run_get`, `run_upsert`, `run_update`, `runs`, `runs_started_on`). `digest.py` prints an "Outreach" section from
+`runs` when it has rows. `--no-trace` skips the hook even when installed.
+
 ## Never published (all gitignored)
 
 `pipeline/config.json`, `pipeline/state/`, `profile/`, `blitz_answers.md`, `resume_*.txt`, `resume_routing_context.md`,
-`keyword_facts.json`, `routing.json`, `resumes/`, and every secret file (Discord token or webhook, TraceHire key).
+`keyword_facts.json`, `routing.json`, `resumes/`, `pipeline/trace.py` (private extension), and every secret file (Discord token or webhook, extension API keys).
 `~/.treg/config.json` and `~/.omp/` live in your home directory, outside the repo.
