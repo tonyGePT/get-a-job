@@ -52,9 +52,37 @@ MANAGER_ALLOW = re.compile(
     re.I)
 
 
+_OVERRIDES = None
+
+
+def overrides():
+    """Optional extra filters from state/discover-overrides.json.
+
+    Written only by retro.py, after a filter category has been skipped by the LLM often enough
+    to be worth a deterministic rule. Kept in state/ (not in code) so a bad rule is removable
+    without a deploy; every pattern is compiled defensively, and a broken one is ignored
+    rather than allowed to stop discovery.
+    """
+    global _OVERRIDES
+    if _OVERRIDES is None:
+        doc = S.read_json(S.path("discover-overrides.json"), {}) or {}
+        def compile_all(items):
+            pats = []
+            for p in items or []:
+                try:
+                    pats.append(re.compile(p, re.I))
+                except (re.error, TypeError):
+                    print("discover-overrides: ignoring bad pattern %r" % (p,))
+            return pats
+        _OVERRIDES = {"title": compile_all(doc.get("title_block")),
+                      "agency": compile_all(doc.get("agency_block"))}
+    return _OVERRIDES
+
+
 def title_blocked(title):
-    return bool(TITLE_BLOCK.search(title)
-                or (MANAGER_BLOCK.search(title) and not MANAGER_ALLOW.search(title)))
+    if TITLE_BLOCK.search(title) or (MANAGER_BLOCK.search(title) and not MANAGER_ALLOW.search(title)):
+        return True
+    return any(p.search(title) for p in overrides()["title"])
 
 
 # BlitzAPI's is_agency flag misses most staffing reposts, so also match the name.
@@ -75,7 +103,9 @@ def blocked_company(name):
     if AGENCY_BLOCK.search(name or ""):
         return True
     extra = S.read_json(S.path("blocklist.json"), {}) or {}
-    return S.norm_text(name) in set(S.norm_text(x) for x in extra.get("companies", []))
+    if S.norm_text(name) in set(S.norm_text(x) for x in extra.get("companies", [])):
+        return True
+    return any(p.search(name or "") for p in overrides()["agency"])
 
 
 def call_treg(payload):

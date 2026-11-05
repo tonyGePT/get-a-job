@@ -36,7 +36,14 @@
     "email": "you@example.com",
     "discord_webhook_file": "C:/path/to/jobharness/pipeline/discord_webhook.txt",
     "discord_channel_id": "",
-    "discord_bot_token_file": "C:/path/to/jobharness/pipeline/discord_bot_token.txt"
+    "discord_bot_token_file": "C:/path/to/jobharness/pipeline/discord_bot_token.txt",
+    "retro_webhook_file": "C:/path/to/jobharness/pipeline/discord_retro_webhook.txt"
+  },
+  "retro": {
+    "enabled": true,
+    "agent_timeout_seconds": 3600,
+    "grace_runs": 2,
+    "max_changes_per_run": 6
   },
   "gws": {
     "node": "C:/Program Files/nodejs/node.exe",

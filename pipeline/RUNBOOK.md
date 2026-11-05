@@ -30,6 +30,7 @@ Windows `omp.exe` with managed Chromium for qualifying and form filling, the Win
 | verify | Python + Gmail API | receipts are ground truth; never trust the agent's claim |
 | trace (optional, private) | `trace.py`, not published | skipped unless `pipeline/trace.py` and a `tracehire` config block exist |
 | digest | Python + Discord | your morning read, posted to the job channel |
+| retro (post-run) | `retro.py` → deterministic telemetry + one `omp -p` review pass | turns yesterday's wasted tokens and broken stages into gated, revertible changes; runs after digest and again at 12:00 |
 
 A model failure can therefore corrupt nothing outside `apply` — and `verify`
 downgrades anything unproven to `unverified` before it is logged or traced.
@@ -61,8 +62,17 @@ C:/tmp/jobharness/pipeline/
                        location, salary. Header carries today's omp tokens/cost, summed from the session files
                        under ~/.omp/agent/sessions/--C--tmp-jobharness-pipeline--/ (incl. qualify/apply subagents).
   watchdog.py          ALERT when the heartbeat goes quiet
+  retro.py             post-run troubleshooter: telemetry → one omp review → gated changes →
+                       state/retro-<date>.md + its own Discord digest. Also: --status, --backfill,
+                       --dry-run, --no-agent, --digest. Holds the same .lock as daily.py, so it can
+                       never run beside a live pipeline.
+  lib/retro_telemetry.py  deterministic evidence packet: funnel, per-stage tokens/cost, tool calls,
+                       skip reasons, apply outcomes, stage durations, hygiene, findings. Python
+                       computes every number; the agent never parses raw logs or transcripts.
+  prompts/retro.md     agent contract: read the packet, propose JSON changes, edit nothing.
   lib/notify.py        Discord: `captcha --key K` (called live by the apply agent for CAPTCHAs it could NOT
-                       solve), `scan` (after apply, deduped via state/discord-sent.json), `test`. Bot token in
+                       solve), `scan` (after apply, deduped via state/discord-sent.json), `test`,
+                       `retro` (stdin → the retro webhook). Bot token in
                        discord_bot_token.txt + notify.discord_channel_id, else the webhook file.
   lib/captcha.py       `solve --method M --sitekey K --url U` → token on stdout (RapidAPI Fast MultiSolver:
                        reCAPTCHA v2/v3, hCaptcha, Turnstile, CaptchaFox). Key read from the `captcha-solver`
@@ -79,6 +89,9 @@ C:/tmp/jobharness/pipeline/
     evidence/<key>.{json,png}   per-application proof (the apply agent writes these)
     verification-<date>.json, trace-results-<date>.json   per-run artefacts of the agents
     digest-<date>.md, heartbeat.json, logs/<date>.log
+    retro-<date>.md, retro-<date>-evidence.json   the troubleshooter's report and evidence packet
+    retro-<date>-proposals.json   the agent's machine-readable proposals (rejected or applied)
+    discover-overrides.json, ats-hints.json   optional rules grown by retro.py; absent = no-op
     ledger.json, ledger.json.bak-<date>   DEAD, imported 2026-10-28 into state.db
 ```
 
@@ -92,6 +105,8 @@ C:/tmp/jobharness/pipeline/
 | `receipts` | Gmail message id | verify, append-only |
 | `history` | one decision/outcome from before the pipeline or entered by hand (`source` = log-import or manual) | one-time import 2026-11-02, then `ledger.py add` |
 | `outreach`, `resume_changes`, `log_notes` | outreach draft/send, resume edit, free-text note from the old log | one-time import, then `ledger.py outreach add` / `resume-change add` |
+| `retro_runs` | one post-run review: KPIs, finding count, agent tokens/cost | retro.py |
+| `retro_actions` | one self-healing change: target, patch, metric, baseline, grade, outcome | retro.py |
 
 Every write is one row in one transaction. Nothing holds a whole-state copy, so a
 manual command running during a long poll can no longer be
@@ -107,6 +122,12 @@ python C:/tmp/jobharness/pipeline/daily.py --days 7         # override the 3-day
 python ledger.py check --company C --title T [--url U]   # duplicate review (exit 1 = prior record found)
 python ledger.py add --company C --title T --url U --action applied|unapplied|skipped|escalated --notes N
 python ledger.py list --days 7                  # recent history rows; also: outreach, resume-change
+python C:/tmp/jobharness/pipeline/retro.py                  # review + self-heal (also runs inside daily.py)
+python C:/tmp/jobharness/pipeline/retro.py --status         # KPI table + pending changes
+python C:/tmp/jobharness/pipeline/retro.py --dry-run        # collect + report only, no agent, no changes
+python C:/tmp/jobharness/pipeline/retro.py --no-agent       # collect + grade + report, skip the model pass
+python C:/tmp/jobharness/pipeline/retro.py --backfill 30    # seed history from past logs
+python C:/tmp/jobharness/pipeline/retro.py --digest         # re-post today's self-healing digest
 python digest.py --no-discord                   # rebuild the digest files, post nothing
 python discover.py --results C:/tmp/saved.json  # run the dedupe offline, call nothing
 python watchdog.py                              # is the pipeline alive?
@@ -123,20 +144,26 @@ JOBHUNT_STATE=C:/tmp/jh-copy python verify.py --days 2
 A failed stage stops `daily.py` but it still posts a digest: a silent failure is worse than a noisy one.
 
 ## Scheduling (registered 2026-10-27)
-
-Two Windows tasks, both hidden (wscript wrapper, no console flash):
+Three Windows tasks, all hidden (wscript wrapper, no console flash):
 
 | Task | Trigger | Command |
 |---|---|---|
 | `JobHuntDaily` | daily 08:00 (moved from 03:00 on 2026-11-03) | `wscript.exe C:\tmp\jobharness\pipeline\daily-hidden.vbs` |
 | `JobHuntWatchdog` | every 120 min | `wscript.exe C:\tmp\jobharness\pipeline\watchdog-hidden.vbs` |
+| `JobHuntRetro` | daily 12:00 (4 h after the start) | `wscript.exe C:\tmp\jobharness\pipeline\retro-hidden.vbs` |
+
+**Retro timing.** `daily.py` calls `retro.py --in-process` after `digest`, so the normal path needs no timer.
+`JobHuntRetro` at 12:00 is the fallback for a run that died before reaching digest, and it is safe to leave
+enabled: retro takes the same `.lock` non-blocking and exits immediately while a run is still going (no stage
+timeouts, so a late run can still be in `apply` at noon). It also exits unless `state/digest-<today>.md` exists,
+so a day with no run does nothing.
 
 **No stage timeouts (2026-11-03).** The qualify and apply agents run until they finish. The model providers congest
 during Asian business hours (roughly midnight to 05:00 PT), which is why the run starts at 08:00 PT. The cost of no
 limit: a genuinely hung agent blocks the run, and the next day's run then exits at the `.lock` check ("another run
 holds the lock") instead of stacking. `watchdog.py` still raises an ALERT after 26 h without a heartbeat.
 
-The wrappers run `daily.bat` / `watchdog.bat`, which call `C:\Python313\python.exe`
+The wrappers run `daily.bat` / `watchdog.bat` / `retro.bat`, which call `C:\Python313\python.exe`
 directly. Re-register with `C:\tmp\jobharness\pipeline\register-tasks.bat` (idempotent, `/F` overwrites).
 treg credentials are read from `%USERPROFILE%\.treg\config.json` (copied from WSL
 `~/.treg` at the cutover; `treg login` on any machine rewrites the same shape).
@@ -170,6 +197,16 @@ A paused readout: `Last Result 0` is success; `JobHuntWatchdog` writes
   downgraded; one Gmail list query per run covers every company, and only
   unconfirmed submissions are re-checked.
 - Receipts must come from an ATS or employer domain; mail you send yourself is excluded.
+- **Retro self-healing is gated, not free-form.** The agent writes two files under `state/` and nothing else;
+  every change is applied by `retro.py`, which (a) only accepts targets in `RETRO_WRITABLE`, (b) never accepts
+  `profile/`, `config.json`, `state/` or `trace.py`, (c) re-compiles every affected `.py` and re-checks required
+  prompt sections before writing, (d) keeps a `.retro-bak` copy, (e) records the change in `retro_actions` with the
+  KPI it claims to move, and (f) auto-reverts it if that KPI regresses for two later runs. Data-only changes
+  (`blocklist`, `discover-overrides.json`, `ats-hints.json`) are merged by Python; patterns are regex-validated.
+- **Retro never runs beside the pipeline.** `daily.py` calls it in-process after `digest`; the 12:00 task takes the
+  same `.lock` non-blocking and exits if the daily run is still alive.
+- **Retro cannot invent candidate facts.** Its prompt forbids `blitz_answers.md`, `resume_*`, `profile/`; escalations
+  that need a human are reported as "For a human", never auto-answered.
 
 ## When it escalates to you
 

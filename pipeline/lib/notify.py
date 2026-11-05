@@ -6,10 +6,14 @@ Transport (first that is configured wins), from config.json `notify`:
               -> POST /channels/<id>/messages with `Authorization: Bot <token>`
   2. webhook: URL in `discord_webhook_file` (posts to whatever channel that webhook belongs to)
 
+The retro digest has its own webhook (`retro_webhook_file`) so the self-healing summary lands
+in its own channel instead of burying the daily digest. It falls back to the normal transport.
+
 CLI:
   notify.py captcha --key <evidence key>   announce one CAPTCHA-blocked application
   notify.py scan [--since-hours 24]        announce every recent evidence file blocked by a CAPTCHA
   notify.py test                           post a one-line connectivity message
+  notify.py retro                          post a retro digest line from stdin
 
 Each CAPTCHA is announced once per (key, day): `state/discord-sent.json` dedupes, so the apply
 agent's live `captcha` call and the post-apply `scan` sweep never double-post.
@@ -38,19 +42,11 @@ def _read(path):
     return open(path, encoding="utf-8").read().strip() if path and os.path.exists(path) else ""
 
 
-def post(content):
-    """Send one message. Returns (ok, detail); never raises."""
+def _post_url(url, content, auth=None):
     content = content[:1900]
-    token, channel = _read(N.get("discord_bot_token_file")), N.get("discord_channel_id")
-    if token and channel:
-        url, auth = "%s/channels/%s/messages" % (API, channel), {"Authorization": "Bot " + token}
-    else:
-        url, auth = _read(N.get("discord_webhook_file")), {}
-        if not url.startswith("http"):
-            return False, "discord not configured (no bot token file / webhook file)"
     req = urllib.request.Request(
         url, data=json.dumps({"content": content}).encode(),
-        headers={"Content-Type": "application/json", "User-Agent": UA, **auth})
+        headers={"Content-Type": "application/json", "User-Agent": UA, **(auth or {})})
     try:
         with urllib.request.urlopen(req, timeout=30) as r:
             return True, r.status
@@ -58,6 +54,26 @@ def post(content):
         return False, "HTTP %s: %s" % (e.code, e.read()[:200].decode("utf-8", "replace"))
     except Exception as e:  # noqa: BLE001
         return False, "discord error: %s" % e
+
+
+def post(content):
+    """Send one message. Returns (ok, detail); never raises."""
+    token, channel = _read(N.get("discord_bot_token_file")), N.get("discord_channel_id")
+    if token and channel:
+        url, auth = "%s/channels/%s/messages" % (API, channel), {"Authorization": "Bot " + token}
+    else:
+        url, auth = _read(N.get("discord_webhook_file")), {}
+        if not url.startswith("http"):
+            return False, "discord not configured (no bot token file / webhook file)"
+    return _post_url(url, content, auth)
+
+
+def post_retro(content):
+    """Send one message to the retro channel, falling back to the normal transport."""
+    url = _read(N.get("retro_webhook_file"))
+    if url.startswith("http"):
+        return _post_url(url, content)
+    return post(content)
 
 
 def post_long(text, limit=1900):
@@ -108,10 +124,16 @@ def main():
     s = sub.add_parser("scan")
     s.add_argument("--since-hours", type=float, default=24)
     sub.add_parser("test")
+    sub.add_parser("retro", help="post stdin to the retro webhook")
     args = ap.parse_args()
 
     if args.cmd == "test":
         ok, detail = post("jobhunt notifications are connected.")
+        print("ok" if ok else "FAILED", detail)
+        return 0 if ok else 1
+
+    if args.cmd == "retro":
+        ok, detail = post_retro(sys.stdin.read())
         print("ok" if ok else "FAILED", detail)
         return 0 if ok else 1
 

@@ -6,8 +6,9 @@ Submit the applications queued in `state/apply-queue.json`. Nothing else.
 
 ## Inputs
 - `state/apply-queue.json` — `{key, company, title, apply_url, ats, resume_pdf, variant}`. Each key already has a tailored resume at 100% keyword coverage.
-- `C:/tmp/jobharness/blitz_answers.md` — the only source of facts you may type (name, email, phone, address, work authorization, salary range, current-company wording, standing background-check consent, EEO answers).
+- `state/ats-hints.json` — optional, grown by the post-run retro from repeated form friction: per-ATS selector/behaviour facts (`greenhouse`, `ashby`, `lever`, `workday`, …). Read the entry for each ATS in the queue before driving that form; it is guidance about the form, never about the candidate.
 - `C:/tmp/jobharness/pipeline/state/jd/<key>.txt` — the job description, for role-specific free text.
+- `C:/tmp/jobharness/blitz_answers.md` — the only source of facts you may type (name, email, phone, address, work authorization, salary range, current-company wording, standing background-check consent, EEO answers).
 
 ## Method
 - This is the prepared queue from today's qualify stage. Do NOT run `ledger.py check`, do NOT use a duplicate-safeguard skill, and do NOT treat today's own `postings` / `verdict=APPLY` row as a prior application. The queue has already been deduped by the pipeline. Only skip for a real prior application (e.g. a confirmed `submitted` row in `state.db` / history) for the same requisition; if uncertain, inspect that prior status and compare ATS requisition URL, not just company/title.

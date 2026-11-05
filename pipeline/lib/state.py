@@ -175,6 +175,41 @@ CREATE TABLE IF NOT EXISTS log_notes (     -- free-text sections of the old log,
   heading  TEXT,
   body     TEXT
 );
+
+CREATE TABLE IF NOT EXISTS retro_runs (    -- one row per day the post-run troubleshooter reviewed
+  date        TEXT PRIMARY KEY,
+  started     TEXT,
+  finished    TEXT,
+  status      TEXT,                       -- collected | agent_ok | agent_failed | dry
+  agent_model TEXT,
+  agent_in    INTEGER NOT NULL DEFAULT 0, -- tokens the retro agent itself burned
+  agent_out   INTEGER NOT NULL DEFAULT 0,
+  agent_cost  REAL,
+  metrics     TEXT,                       -- JSON: the day's KPI dict (funnel, cost, quality)
+  findings    INTEGER NOT NULL DEFAULT 0,
+  actions     INTEGER NOT NULL DEFAULT 0,
+  report      TEXT,                       -- state/retro-<date>.md
+  error       TEXT
+);
+
+CREATE TABLE IF NOT EXISTS retro_actions ( -- every self-healing change: gradable and revertible
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  day         TEXT NOT NULL,              -- retro run that made the change
+  kind        TEXT NOT NULL,              -- blocklist | discover_regex | ats_hint | prompt | code | config
+  target      TEXT NOT NULL,              -- file the change lives in, relative to pipeline/
+  summary     TEXT NOT NULL,
+  evidence    TEXT,                       -- the finding(s) that justified it
+  metric      TEXT,                       -- KPI this change claims to move
+  direction   TEXT,                       -- down | up
+  baseline    REAL,                       -- metric value when the change was applied
+  expected    TEXT,                       -- one sentence: what should change, by how much
+  patch       TEXT,                       -- unified diff, or the JSON payload for data-only changes
+  status      TEXT NOT NULL DEFAULT 'applied',  -- applied | verified | reverted | failed | proposed
+  graded_on   TEXT,
+  outcome     TEXT
+);
+CREATE INDEX IF NOT EXISTS retro_actions_day ON retro_actions (day);
+CREATE INDEX IF NOT EXISTS retro_actions_status ON retro_actions (status);
 """
 
 
@@ -688,6 +723,76 @@ def history_add(conn, company, title, url="", resume="", confidence="", signals=
             (date or TODAY, company, title, url, norm_url(url), norm_text(company), norm_text(title),
              resume, confidence, signals, action, status, TODAY, notes, source))
     return cur.lastrowid
+
+
+# ---------------------------------------------------------------------------
+# retro: the post-run troubleshooter's own ledger (KPIs + every change it made)
+# ---------------------------------------------------------------------------
+
+RETRO_RUN_FIELDS = ("date", "started", "finished", "status", "agent_model", "agent_in",
+                    "agent_out", "agent_cost", "metrics", "findings", "actions", "report", "error")
+
+RETRO_ACTION_FIELDS = ("day", "kind", "target", "summary", "evidence", "metric", "direction",
+                       "baseline", "expected", "patch", "status", "graded_on", "outcome")
+
+
+def retro_run_upsert(conn, rec):
+    """Insert or update one day's retro row.
+
+    Partial writes are normal (collect first, agent result later), so only the keys actually
+    passed are written: a later call never zeroes an earlier finding count, and `error=""`
+    clears a stale error. Counters omitted on the first INSERT default to 0 in the schema.
+    """
+    values = {k: rec.get(k) for k in RETRO_RUN_FIELDS if k in rec}
+    if not values.get("date"):
+        raise ValueError("retro run without date")
+    cols = ", ".join(values)
+    marks = ", ".join("?" for _ in values)
+    updates = ", ".join("%s=excluded.%s" % (k, k) for k in values if k != "date")
+    with tx(conn):
+        conn.execute("INSERT INTO retro_runs (%s) VALUES (%s) ON CONFLICT(date) DO UPDATE SET %s"
+                     % (cols, marks, updates), list(values.values()))
+
+
+def retro_run_get(conn, day):
+    row = conn.execute("SELECT * FROM retro_runs WHERE date=?", (day,)).fetchone()
+    return dict(row) if row else None
+
+
+def retro_action_add(conn, **rec):
+    missing = {"day", "kind", "target", "summary"} - set(rec)
+    if missing:
+        raise ValueError("retro action missing: %s" % ", ".join(sorted(missing)))
+    values = {k: rec.get(k) for k in RETRO_ACTION_FIELDS}
+    values["status"] = values.get("status") or "applied"
+    cols = ", ".join(RETRO_ACTION_FIELDS)
+    marks = ", ".join("?" for _ in RETRO_ACTION_FIELDS)
+    with tx(conn):
+        cur = conn.execute("INSERT INTO retro_actions (%s) VALUES (%s)" % (cols, marks),
+                           [values[k] for k in RETRO_ACTION_FIELDS])
+    return cur.lastrowid
+
+
+def retro_actions(conn, where="1=1", params=()):
+    return [dict(r) for r in conn.execute(
+        "SELECT * FROM retro_actions WHERE %s ORDER BY id" % where, params).fetchall()]
+
+
+def retro_action_set(conn, action_id, **fields):
+    bad = set(fields) - set(RETRO_ACTION_FIELDS) - {"id"}
+    if bad:
+        raise ValueError("unknown action fields: %s" % ", ".join(sorted(bad)))
+    if not fields:
+        return
+    sets = ", ".join("%s=?" % k for k in fields)
+    with tx(conn):
+        conn.execute("UPDATE retro_actions SET %s WHERE id=?" % sets,
+                     list(fields.values()) + [action_id])
+
+
+def retro_runs(conn, limit=30):
+    return [dict(r) for r in conn.execute(
+        "SELECT * FROM retro_runs ORDER BY date DESC LIMIT ?", (limit,)).fetchall()]
 
 
 def seen_index(conn=None):

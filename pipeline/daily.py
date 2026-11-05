@@ -116,6 +116,15 @@ def pipeline(args):
 
     stage("digest")
     script("digest.py")
+
+    # Post-run troubleshooter. Runs in the same process, after every other stage, so it can
+    # never race the apply agent for a tab or the .lock; its own scheduled task (JobHuntRetro)
+    # is the fallback for runs that die before reaching here. Never fatal: a bad review must
+    # not turn a successful day into a failed one.
+    if S.CONFIG.get("retro", {}).get("enabled", True):
+        stage("retro")
+        script("retro.py", "--day", S.TODAY, "--in-process", required=False, label="retro")
+
     log("[%s] done" % time.strftime("%H:%M:%S"))
 
 
