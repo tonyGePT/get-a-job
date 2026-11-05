@@ -35,11 +35,13 @@ into `state/pow/artifacts/`, and do not start any other process that changes the
    `task.json`, and records what the fetch cost.
 2. **Numbers.** Wherever a count belongs in `title`, `thesis`, `email_line` or a finding claim,
    write a placeholder (`{n_accounts}`, `{n_multi}`, `{window_days}`, `{freshest_days}`,
-   `{n_recent_3d}`, or `{n_ats_match}` where the recipe section says it exists). Python substitutes
-   the count it computed from your validated rows. A bare number of two or more digits in those
-   fields is rejected, so is an unknown placeholder, and so is a count that resolves to 0 or 1 in
-   `title`, `thesis` or `email_line` (a statistic that small is not a hook: leave it out). A figure
-   on the page is either computed from the evidence or absent.
+   `{n_recent_3d}`, `{n_recent_7d}`, `{n_roles_total}`, `{max_roles}`, or `{n_ats_match}` where the
+   recipe section says it exists). Python substitutes the count it computed from your validated
+   rows. Nothing else may supply a number in those fields: a digit of any length and a spelled-out
+   cardinal ("four", "a dozen") are both rejected, an unknown placeholder is rejected, and so is a
+   count that resolves to 0 or 1 (a statistic that small is not a hook: leave it out). Ordinals
+   ("fourth") are words, not counts. A figure on the page is either computed from the evidence or
+   absent.
 3. **Findings are positive.** A claim of the form "none of… reveals…", "no partner was found" is a
    limitation, not an insight, and is rejected in a finding. Put what the pack cannot see in
    `limitations`.
@@ -47,7 +49,8 @@ into `state/pow/artifacts/`, and do not start any other process that changes the
 When a recipe section names a deliverable file, that file's content is parsed and re-checked
 against the fetched data, and anything Python can derive it derives: a cell that comes from the
 fetch is filled and quoted by Python, so a row only has to trace back to the fetch. The recipe
-section says exactly what you supply.
+section says exactly what you supply. A recipe may also set shorter limits than the schema below
+(its headline, its lede, its finding claims); those are enforced when the candidate is composed.
 
 ## What the artifact is for
 

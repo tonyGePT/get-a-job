@@ -220,6 +220,7 @@ python pipeline/pow.py signals --dry-run …          # free: print the request,
 python pipeline/pow.py generate --url <posting url>                 # one omp pass, metered
 python pipeline/pow.py generate --url <url> --candidate cand.json   # validate/store a candidate you wrote
 python pipeline/pow.py validate cand.json --url U --company C --role R --recipe R
+python pipeline/pow.py check               # free, offline: re-validate the repair candidate
 python pipeline/pow.py run <artifact_id>            # ai_eval: built-in evaluator
 python pipeline/pow.py run <artifact_id> --execute  # FDE: runs the artifact's own code (opt-in)
 python pipeline/pow.py publish <artifact_id>        # requires pow.publish_enabled
@@ -260,10 +261,17 @@ python pipeline/pow.py smoke                        # offline end-to-end: temp D
   operators, then multi-posting companies. `title`, `thesis` and `email_line` may name kept accounts
   (case-insensitive); Python refuses a company-shaped name (`Logistics`, `Freight`, `Inc.`, …) that is not
   the employer, an integration partner or a kept row, and refuses any fetched company the pack dropped.
-  Recency is a computed placeholder (`{freshest_days}`, `{n_recent_3d}`), a count that resolves to 0 or 1 in
-  the headline is refused ("1 accounts" is not a hook), a finding may not be a statement of absence ("none of
-  the URLs reveals…" belongs in `limitations`), and `{n_ats_match}` only exists from two matching rows up —
-  the postings are mostly LinkedIn URLs, so ATS is not the hook.
+  Recency is a computed placeholder (`{freshest_days}`, `{n_recent_3d}`, `{n_recent_7d}`), as is scale
+  (`{n_roles_total}`, `{max_roles}`), a count that resolves to 0 or 1 is refused wherever it is used
+  ("1 accounts" is not a hook), and a finding may not be a statement of absence ("none of the URLs reveals…"
+  belongs in `limitations`). Nothing else may supply a number in `title`/`thesis`/`email_line`/a finding
+  claim: a digit of any length and a spelled-out cardinal ("four", "a dozen") are both refused (ordinals
+  are words, not counts), because a fabricated "Maersk posted four openings" over a one-posting store got
+  through the digit-only rule twice. A per-account count cannot be stated at all — the table's `detail`
+  column carries it — and a vague "several/multiple postings" attached to a named account is checked
+  against that account's fetched posting count. ATS is not part of the recipe at all now: `accounts.csv`
+  keeps the `ats` column and Python still fills it from the posting URL, but nothing in the prompt asks for an
+  ATS angle (`{n_ats_match}` still resolves when ≥2 rows match, and is ignored otherwise).
 - **Grounding is re-derived, not trusted.** Every fetch lands in `state/pow/signals/<token>.jsonl`; validation requires
   each `accounts.csv` row's evidence URL to exist there, the account to be that posting's company, the trigger to use
   the posting's own title words, the posted date to be the fetched date inside the window, the `ats` column to be what
@@ -274,11 +282,46 @@ python pipeline/pow.py smoke                        # offline end-to-end: temp D
   candidate without a signal store is refused outright. For a candidate you wrote by hand, `--signals FILE` (or
   `JOBHUNT_POW_SIGNALS`) points validation at an existing store, which is how the offline smoke, a salvage run and any
   re-validation work.
-- **Every pack carries its own method.** One finding must be the method: the trigger, the funnel
-  counts and the keywords that ran — `{n_fetched}` postings retrieved, `{n_companies}` distinct
-  companies, `{n_accounts}` kept, `{window_days}`-day window, and `{titles}` rendered from the fetch
-  log (never from the model). Python rejects a `gtm_signal` candidate with no such finding, so the
-  page reads as a rule the reader could re-run instead of a list that appeared.
+- **Findings are the product; there is no method finding.** The page renders only the title, one lede
+  sentence, the findings and the table, so three findings (≤140 characters each, plain words, positive and
+  checkable from the rows) carry the value, ordered with the single most useful takeaway first. There is no
+  required "method" claim: `{n_fetched}`, `{n_companies}` and `{titles}` remain available as optional
+  computed placeholders, and nothing demands them. Compose-time copy limits (`GTM_COPY`) enforce the card:
+  title ≤70, thesis one sentence ≤140, claim ≤140, three findings and ≤4 short limitations (required in the
+  JSON, not rendered), and no jargon ("signals", "triggers", "operationalize"). `deliverable.summary` is not
+  capped: nothing renders it. Those limits are a writing rule: they run in
+  `ground_gtm_candidate`/`cmd_validate` before the artifact is composed, and
+  `validate_artifact`/`scan_publish_safety` are untouched, so an artifact accepted earlier keeps its shape and
+  still publishes (the smoke proves it with a legacy-shaped artifact: long headline, two-sentence lede, four
+  findings, six bullets).
+- **Python owns the evidence ids of a `gtm_signal` finding.** They are never rendered, so guessing one must not
+  cost an artifact: `repair_gtm_evidence` keeps the ids that still resolve, and for an id naming an `acct-<n>`
+  that no longer exists (or an empty list) it substitutes every kept row's account source plus the employer
+  pages the agent cited. Nothing is invented — `rebuild_gtm_rows` wrote each acct source from a fetched
+  posting — and an unknown non-`acct` id is left alone so the validator still refuses a claim about a page
+  nobody declared.
+
+- **A near-miss gets one short repair pass instead of a whole re-run.** Real failures are small — a stray `)`
+  instead of `}` at end of file, one fabricated number in a finding, a stale `acct-<n>`, an over-long line — and the
+  validator's own message says which. After the agent pass, `pow.py` trials the candidate (same checks, nothing
+  stored); if it is unreadable JSON or fails validation/grounding (not an abstention, not a missing signal store or a
+  spent budget) it runs **one** repair pass (`pow.repair_passes`, default 1, `0` disables) with
+  `prompts/pow-repair.md`: the verbatim error list (for corrupt JSON, the parser message with line/column and the last
+  200 characters), the absolute path of a **copy** at `state/pow/candidates/<token>.repair.json`, and a brief to edit
+  only that file, fix only what an error requires, add no accounts and use placeholders for any number — including
+  rewriting a claim the rows cannot support into one they do. Inside that one pass the agent runs the free, offline
+  `pow.py check` after every edit and loops on it until it prints `valid`: a syntax error masks the content errors
+  behind it, so a single blind fix is not enough. `check` runs exactly the accepting path in trial mode (nothing is
+  written, no DB row, no treg, no agent) and prints `valid` or a numbered list of every problem; it is the only
+  command allowed while a repair runs. The pass is capped at `min(pow.repair_budget_usd, pow.agent_budget_usd)`
+  (default 1.00) — dollars are the only bound, there is no step count and no timeout — and marked
+  (`JOBHUNT_POW_REPAIR` plus `repair: true` in `task.json`), so `pow.py signals` exits 2 with
+  `repair pass: no new fetches`: repair can never spend treg money. Python then judges the file itself (the agent's
+  word is never trusted): accepted → stored with `repair_passes` on its `generated` event, still failing →
+  `rejected` with **both** error lists (`before the repair pass:` / `after the repair pass:`) and no second pass. The
+  operator can run the same pass by hand over an existing candidate:
+  `pow.py generate --url U --company C --role R --recipe gtm_signal --candidate FILE --signals <token>.jsonl --repair`
+  (the original file stays as evidence; the copy is what gets fixed).
 
 - **The model writes a candidate; Python decides.** The envelope (`posting_url`, `company`, `role`, `recipe`,
   `artifact_id`, `generated_at`) is filled by `pow.py`, so an artifact cannot be mislabelled. A candidate that is not
@@ -289,10 +332,11 @@ python pipeline/pow.py smoke                        # offline end-to-end: temp D
   allowed when `pow.py` executed them, and per-recipe minimums (GTM: `accounts.csv` + grounded rows + 3-5 findings +
   one source per row; FDE: docs evidence + a runnable file + explicit execution status; AI eval: an executed `eval:`
   result). Headline numbers are **placeholders** (`{n_accounts}`, `{n_multi}`, `{window_days}`,
-  `{freshest_days}`, `{n_recent_3d}`, plus `{n_fetched}`, `{n_companies}`, `{titles}` and `{n_ats_match}`
-  where the recipe defines them): Python substitutes the counts it computed from the grounded rows, a bare
-  two-or-more-digit number in `title`, `thesis`, `email_line` or a finding claim is rejected, and so is a
-  placeholder that resolves to 0 or 1 in `title`, `thesis` or `email_line`. A 12-word run copied from the job
+  `{freshest_days}`, `{n_recent_3d}`, `{n_recent_7d}`, `{n_roles_total}`, `{max_roles}`, with `{n_fetched}`,
+  `{n_companies}`, `{titles}` and `{n_ats_match}` as optional computed extras): Python substitutes the counts
+  it computed from the grounded rows, nothing else may supply a number in `title`, `thesis`, `email_line` or a
+  finding claim (no digits of any length, no spelled-out cardinals), and a placeholder that resolves to 0 or 1
+  is refused wherever it is used. A 12-word run copied from the job
   description or the resume is rejected, as are email addresses, phone numbers, credentials and local paths
   (`scan_publish_safety`; the host re-checks and 422s on the same classes).
 - **Nothing model-written runs automatically.** `ai_eval` artifacts are executed by a built-in deterministic evaluator
@@ -349,12 +393,27 @@ Outcomes are measured only from a sent event's timestamp through the configured 
 `treg` response ingested by `signals`, the built-in evaluator, and the privacy/execution/grounding refusals — no agent
 pass, no paid call, no external network. It asserts the positive path (grounded rows pass, placeholders resolve to the
 computed counts, a hand-crafted `accounts.csv` is rebuilt cell by cell with proper quoting, a title names kept accounts
-and states the computed recency, the candidate's row order is preserved) and the negative ones (a row absent from the
-fetch, an invented headline number, a count that resolves to 0 or 1 in the headline, a finding that states an absence, a
-company-shaped name that is not a kept row, a fetched company the pack dropped, `{n_ats_match}` with fewer than two
-matches, fewer than 8 accounts → abstention, a spend budget that stops the fetch, a finding that cites a pruned account
-source). It also asserts that one omp pass is built with `--max-cost <pow.agent_budget_usd>` and no timeout, and that
-`signals` prints the pool and the spend after every call, against a mocked subprocess and fixture responses.
+and the lede states the computed recency, the candidate's row order is preserved, a candidate with **no method finding**
+is accepted, the accepted page fits every copy limit, a finding naming a pruned `acct-<n>` is repaired to the kept
+rows' sources (keeping its valid employer ids), a finding with no ids is given every kept row's source, and an artifact
+accepted before the copy limits still publishes even with a long headline, a two-sentence lede, four findings and six
+bullets) and the negative ones (a row absent from
+the fetch, an invented headline number, a count that resolves to 0 or 1 anywhere it is used, a finding that states an
+absence, a company-shaped name that is not a kept row, a fetched company the pack dropped, `{n_ats_match}` with fewer
+than two matches, a headline over 70 characters, jargon in the headline, a fourth finding, a claim over 140 characters,
+a spelled-out cardinal and a typed digit in a finding, a spelled-out cardinal in the lede, a "several" claim over a
+single-posting account, fewer than 8 accounts → abstention, a spend budget that stops the fetch, an unknown non-`acct`
+evidence id). It also asserts the positive number path: an ordinal ("on November fourth") is not a count, `several` is
+accepted for an account the fetch shows with two postings, and `{n_roles_total}`/`{max_roles}` resolve to the computed
+figures. It also proves the repair loop against a fake `omp` (`JOBHUNT_POW_OMP`): a corrupt candidate gets exactly one
+repair pass and is then accepted, a candidate that still fails is rejected with both error lists and is never repaired
+twice, `repair_passes: 0` disables the pass, `pow.py signals` refuses during a repair (env var and task flag), an
+abstention triggers no repair, `--repair` fixes a copy while the operator's file stays byte-identical, and inside the
+pass the mock repair agent really runs `pow.py check` — fixing the syntax first, then the content, and being accepted
+only when `check` printed `valid` (a mocked agent that never gets there is rejected with both lists; `check` itself
+writes nothing and is allowed under the repair flag). Finally, it
+asserts that one omp pass is built with `--max-cost <pow.agent_budget_usd>` and no timeout, and that `signals` prints
+the pool and the spend after every call, against a mocked subprocess and fixture responses.
 
 ## Config
 
@@ -374,7 +433,7 @@ source). It also asserts that one omp pass is built with `--max-cost <pow.agent_
 | `gws.node`, `gws.cli` | absolute path to `node` and to `@googleworkspace/cli/run-gws.js`. The author launches gws as `node run-gws.js` because the Windows `.cmd` shim mangles JSON arguments. On macOS/Linux change `verify.py` to call `gws` directly |
 | `pow.enabled`, `pow.daily` | **both default `false`.** The after-verify generation stage runs only when both are true, so a fresh config never spends an agent pass or creates a public page |
 | `pow.publish_enabled`, `pow.attach_enabled` | **default `false`.** `pow.py publish` / `attach` refuse without them, even when an explicit artifact id is given; the scheduled run never calls either |
-| `pow.max_per_day`, `pow.agent_budget_usd`, `pow.exec_timeout_seconds` | generation cap per local day (default 1), dollar cap on one omp pass (default 2.00, passed as `omp --max-cost`; exit 3 means the cap was reached and the candidate on disk is validated anyway), hard bound on one evaluator/harness run (60 s — a local child process costs nothing and a runaway loop would hold the pipeline `.lock`) |
+| `pow.max_per_day`, `pow.agent_budget_usd`, `pow.repair_passes`, `pow.repair_budget_usd`, `pow.exec_timeout_seconds` | generation cap per local day (default 1), dollar cap on one omp pass (default 2.00, passed as `omp --max-cost`; exit 3 means the cap was reached and the candidate on disk is validated anyway), how many repair passes a generation may spend on a near-miss candidate (default 1, `0` disables) and the cap on one of them (default 1.00; the pass gets the smaller of it and `agent_budget_usd`, and it loops on `pow.py check` until the file is valid or the money is gone), hard bound on one evaluator/harness run (60 s — a local child process costs nothing and a runaway loop would hold the pipeline `.lock`) |
 | `pow.window_days`, `pow.signal_window_days` | how recent a confirmed application must be to get an artifact (default 7), and the "posted within N days" window for a `gtm_signal` posting fetch and its validation (default 30) |
 | `pow.treg_budget_usd` | the only bound on the `gtm_signal` signal fetch per artifact: dollars (default 0.75). There is no call cap — a run keeps paginating until the money or the cursor runs out. Python stops and says so when the budget is spent, and records the real spend on the artifact's `generated` event |
 

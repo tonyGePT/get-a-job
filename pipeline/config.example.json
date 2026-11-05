@@ -52,6 +52,8 @@
     "attach_enabled": false,
     "max_per_day": 1,
     "agent_budget_usd": 2.0,
+    "repair_passes": 1,
+    "repair_budget_usd": 1.0,
     "exec_timeout_seconds": 60,
     "window_days": 7,
     "signal_window_days": 30,

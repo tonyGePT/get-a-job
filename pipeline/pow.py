@@ -5,6 +5,9 @@ Usage:
   python pow.py signals --titles "driver recruiter,fleet safety manager" [--days 21]
                         [--countries US] [--keywords …] [--limit 50] [--pages 1] [--token T]
   python pow.py generate --url <posting url> [--recipe R] [--candidate FILE] [--force] [--dry-run]
+  python pow.py generate --url U --company C --role R --recipe R --candidate FILE \
+                        --signals <token>.jsonl --repair      # one repair pass, no fetches
+  python pow.py check                        # free, offline re-validation of the repair candidate
   python pow.py validate <file> [--url U --company C --role R --recipe R] [--signals FILE]
   python pow.py run <artifact_id|file> [--execute]
   python pow.py publish <artifact_id> [--base URL --key-file FILE]
@@ -29,6 +32,8 @@ Config (`pow` block in config.json, all default-off):
   daily                   false  - the after-verify stage in daily.py is skipped
   max_per_day             1      - generations started per local day by that stage
   agent_budget_usd        2.00   - hard cap on one omp pass (`omp --max-cost`; print mode exits 3)
+  repair_passes           1      - short follow-up passes that fix a near-miss candidate (0 = off)
+  repair_budget_usd       1.00   - cap on one repair pass; the smaller of it and agent_budget_usd
   exec_timeout_seconds    60     - hard bound on one evaluator / harness run
   signal_window_days      30     - "posted within" window for the gtm_signal fetch + validation
   treg_budget_usd         0.75   - hard cap on treg spend for ONE artifact's signal fetch
@@ -59,7 +64,14 @@ Signal fetch (the only place this program calls treg):
   accounts   a gtm_signal candidate supplies the chosen posting URLs; `rebuild_gtm_rows` writes
              every other cell of accounts.csv from the store, so quoting, dates and role counts
              can only come from the fetch. A headline may name a kept account, and every
-             company-shaped name is checked against the table (`check_names`).
+             company-shaped name is checked against the table (`check_names`). Evidence ids are
+             Python's too: `repair_gtm_evidence` replaces a guessed or pruned `acct-<n>` with the
+             kept rows' own sources, so a slip in an id the reader never sees costs nothing.
+  page       the published page renders only the title, one lede sentence, the findings and the
+             accounts table. Those four pieces are checked for length and plainness at GENERATION
+             time (`check_gtm_copy`), never at publish time, so a stored artifact keeps the shape
+             it was accepted with. Limitations and the summary stay required in the JSON for
+             honesty but are not rendered.
   auth       the same ~/.treg/config.json token `discover.py` uses; never printed or logged.
 """
 
@@ -134,11 +146,42 @@ GTM_TARGET_ACCOUNTS = 12                 # what a selective pack needs; 12..20 i
 GTM_MAX_ACCOUNTS = 25
 GTM_PARTNER_SOURCES = 3                  # employer pages whose excerpts define buyers + partners
 
+# The published page is a skimmable card, and only four things are rendered: the headline, one
+# lede sentence, the findings (the primary value, at the top) and the accounts table. Limitations,
+# the summary, sources and evidence ids stay in the JSON for grounding and honesty but are never
+# shown. So the model's visible text is checked for length and plainness when the artifact is
+# GENERATED — never at publish time, so a stored artifact keeps the shape it was accepted with.
+GTM_COPY = {
+    "title": 70,                         # one glance, plain words, the value they get
+    "thesis": 140,                       # one sentence, after placeholder resolution
+    "claim": 140,                        # each finding: the page's primary content
+    "findings": 3,                       # the whole visible insight layer
+    "email_line": 200,                   # already the generic cap; kept here for one report
+    "limitations": 4,                    # short bullets (kept in the JSON for honesty)
+    "limitation": 200,
+}
+GTM_JARGON_RE = re.compile(r"\b(signals?|triggers?|operationali[sz]e[sd]?|icps?|tam|abm)\b",
+                           re.I)
+GTM_META_RE = re.compile(r"\b(?:based on|may indicate|might indicate|could indicate|"
+                         r"useful starting point|starting point|this artifact|this page)\b", re.I)
+# Numbers are the model's least reliable output and the page's most quotable content: outside a
+# placeholder, neither a digit run nor a spelled-out cardinal may appear in the copied text. Ordinals
+# ("fourth") are words, not counts, so they pass — a date in digits does not.
+NUMBER_WORD_RE = re.compile(
+    r"\b(?:zero|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|"
+    r"fifteen|sixteen|seventeen|eighteen|nineteen|twenty|thirty|forty|fifty|sixty|seventy|"
+    r"eighty|ninety|hundred|thousand|dozen)\b|\ba couple of\b", re.I)
+# Vague plurality is not a count, but attached to a NAMED account it is a checkable claim.
+MULTI_CLAIM_RE = re.compile(r"\b(?:several|multiple|more than one)\s+(?:[\w-]+\s+){0,4}"
+                            r"(?:roles?|openings?|postings?|seats?|jobs?|positions?|recruiters?)\b",
+                            re.I)
+
 # Placeholders are the only way a number (or the fetch's own keyword list) reaches the published
 # page: Python substitutes what it computed from the fetched rows, so a headline figure cannot be
-# invented and the method line cannot misquote the search.
+# invented. {n_fetched}, {n_companies} and {titles} are OPTIONAL context: nothing requires them.
 PLACEHOLDERS = ("n_accounts", "n_multi", "window_days", "n_ats_match",
-                "n_fetched", "n_companies", "titles", "freshest_days", "n_recent_3d")
+                "n_fetched", "n_companies", "titles", "freshest_days", "n_recent_3d",
+                "n_roles_total", "n_recent_7d", "max_roles")
 
 # A "finding" that states an absence ("none of the URLs reveals…", "no partner was found") is a
 # limitation, not an insight: the page's findings are positive, checkable statements about the rows.
@@ -1111,6 +1154,84 @@ def check_names(text, where, kept, store, employer=""):
     return errors
 
 
+def repair_gtm_evidence(cand):
+    """Point every finding at sources that exist. The model never numbers `acct-<n>` itself.
+
+    Evidence ids are not rendered any more, so an id the model guessed — or one that pointed at an
+    account row Python pruned — must not cost the artifact. For each finding: the ids that still
+    resolve are kept; if the list names an `acct-<n>` that no longer exists, or is empty, it becomes
+    every kept row's account source (these findings are claims about the table as a whole, and those
+    fetched postings are the evidence) plus whatever employer pages survived. Nothing is invented:
+    `rebuild_gtm_rows` wrote each acct source from a fetched posting, and an unknown NON-acct id is
+    left in place, because that is a claim about a page nobody declared and the validator must still
+    refuse it.
+    """
+    findings = cand.get("findings")
+    if not isinstance(findings, list):
+        return
+    sources = [s for s in (cand.get("sources") or []) if isinstance(s, dict)]
+    ids = [_as_text(s.get("id")) for s in sources]
+    known = {i for i in ids if i}
+    acct = [i for i in ids if i.startswith("acct-")]
+    rows = []
+    for i, f in enumerate(findings):
+        if not isinstance(f, dict):
+            rows.append(f)
+            continue
+        given = f.get("evidence_ids")
+        given = [str(x) for x in given] if isinstance(given, list) else []
+        unknown = [x for x in given if x and x not in known]
+        if any(not x.startswith("acct-") for x in unknown):
+            rows.append(f)                 # an undeclared page: the validator refuses it
+            continue
+        if not unknown and given:
+            rows.append(f)
+            continue
+        f = dict(f)
+        f["evidence_ids"] = acct + [x for x in given if x in known and not x.startswith("acct-")]
+        rows.append(f)
+    cand["findings"] = rows
+
+
+def _account_aliases(name):
+    """Ways a claim can refer to a kept account: the full name, or its distinctive words."""
+    norm = _name_norm(name)
+    if not norm:
+        return []
+    out = {norm}
+    for tok in norm.split():
+        if len(tok) >= 4 and tok not in NAME_DESIGNATOR and not tok.isdigit():
+            out.add(tok)
+    return sorted(out)
+
+
+def check_gtm_named_counts(text, where, chosen):
+    """A vague "several/multiple postings" attached to a named account must match the fetch.
+
+    The table's `detail` column is the only place a per-account count can live, so a claim that
+    says "Maersk posted several openings" is checked against Maersk's fetched posting count and
+    refused with the real number when it overstates it.
+    """
+    if not isinstance(text, str) or not text.strip():
+        return []
+    norm = _name_norm(text)
+    for ch in chosen:
+        if ch["roles"] >= 2:
+            continue
+        for alias in _account_aliases(ch["account"]):
+            hit = None
+            for m in re.finditer(r"(?<![a-z0-9])%s(?![a-z0-9])" % re.escape(alias), norm):
+                found = MULTI_CLAIM_RE.search(norm[m.end():m.end() + 80])
+                if found:
+                    hit = found.group(0)
+                    break
+            if hit:
+                return ["%s says %r of %s, but the fetch returned %d posting(s) for that company: "
+                        "name the role instead, and let the table's detail column carry the count"
+                        % (where, hit, ch["account"], ch["roles"])]
+    return []
+
+
 def ground_gtm(cand, rows, meta=None, company=""):
     """Ground one gtm_signal candidate in the fetched rows. Returns (errors, values, extra).
 
@@ -1295,6 +1416,10 @@ def ground_gtm(cand, rows, meta=None, company=""):
     missing = sorted(wanted - set(acct))
     if missing:
         errors.append("missing account source(s): %s" % ", ".join(missing[:5]))
+    # Evidence ids are never rendered, so Python owns them for gtm_signal: the model cites the
+    # employer pages it read, and any acct-<n> that no longer exists (or an empty list) is replaced
+    # with the kept rows' own sources instead of costing the artifact.
+    repair_gtm_evidence(cand)
 
     partner_text = " ".join(_as_text(s.get("excerpt")) for s in employer).lower()
     partners = [v for v in ATS_VENDORS
@@ -1315,6 +1440,10 @@ def ground_gtm(cand, rows, meta=None, company=""):
     if ages:
         values["freshest_days"] = min(ages)
         values["n_recent_3d"] = sum(1 for a in ages if a <= 3)
+        values["n_recent_7d"] = sum(1 for a in ages if a <= 7)
+    # How much of the work the table actually holds: the postings behind the kept accounts.
+    values["n_roles_total"] = sum(ch["roles"] for ch in chosen)
+    values["max_roles"] = max((ch["roles"] for ch in chosen), default=0)
     if partners:
         # A single match is not a selling point, and the postings are mostly LinkedIn URLs where
         # the ATS is invisible at all: the placeholder exists only from two rows up.
@@ -1323,22 +1452,10 @@ def ground_gtm(cand, rows, meta=None, company=""):
             values["n_ats_match"] = n_match
     keywords = signal_titles(meta)
     if keywords:
-        # The keywords come from the fetch ledger, never from the model: the method line states
-        # the search that produced the pack, so it has to be the search that ran.
+        # The keywords come from the fetch ledger, never from the model: if a claim states the
+        # search, it has to be the search that ran.
         values["titles"] = ", ".join(keywords)
 
-    # One finding has to be the method: the replicable rule (trigger + funnel + keywords), not a
-    # bare list. It is identified deterministically by the placeholders it must carry.
-    claims = [str(f.get("claim") or "") for f in (cand.get("findings") or [])
-              if isinstance(f, dict)]
-    methods = [c for c in claims if all(t in c for t in ("{n_fetched}", "{n_companies}",
-                                                         "{titles}"))]
-    if len(methods) != 1:
-        errors.append("gtm_signal needs exactly one METHOD finding: a single claim that states "
-                      "the filter and the funnel with {n_fetched} postings retrieved, "
-                      "{n_companies} distinct companies, {n_accounts} kept, {titles} as the "
-                      "title keywords used and the {window_days}-day window (found %d such "
-                      "finding(s))" % len(methods))
     # A finding is a positive, checkable read of the rows. "None of the URLs reveals…" is what
     # this is not: absence belongs in limitations, where the page says what it cannot see.
     for i, f in enumerate(cand.get("findings") or []):
@@ -1353,11 +1470,17 @@ def ground_gtm(cand, rows, meta=None, company=""):
                               "multi-location operators) and put what is missing in limitations"
                               % (i, hit.group(0)))
                 break
-    # A name on the page has to be an account the page shows.
+    # A name on the page has to be an account the page shows — headline, lede and findings alike.
     kept_names = [_as_text(ch["account"]) for ch in chosen]
     store_names = [_as_text(r.get("company")) for r in rows]
     for field in ("title", "thesis", "email_line"):
         errors.extend(check_names(cand.get(field), field, kept_names, store_names, company))
+        errors.extend(check_gtm_named_counts(cand.get(field), field, chosen))
+    for i, f in enumerate(cand.get("findings") or []):
+        if isinstance(f, dict):
+            errors.extend(check_names(f.get("claim"), "findings[%d].claim" % i, kept_names,
+                                      store_names, company))
+            errors.extend(check_gtm_named_counts(f.get("claim"), "findings[%d].claim" % i, chosen))
     return errors, values, extra
 
 
@@ -1369,13 +1492,13 @@ def values_none():
 def resolve_placeholders(cand, values, errors):
     """Substitute the computed counts (and the fetched keyword list) for their placeholders.
 
-    Unknown placeholders and, in the headline fields and finding claims, bare two-or-more-digit
-    numbers are refused: every figure on the page is then a count Python computed from the
-    validated rows, and the method line quotes the search that actually ran. In `title`, `thesis`
-    and `email_line` a count that resolves to 0 or 1 is refused too: "1 accounts" and "repeat
-    openings at 1" are not hooks, so such a statistic has no business in the headline.
+    In `title`, `thesis`, `email_line` and every finding claim nothing may supply a number except a
+    placeholder: a digit run of any length and a spelled-out cardinal ("four", "a dozen") are both
+    refused, because a figure on the page has to be one Python computed from the validated rows.
+    Ordinals ("fourth") are words, not counts, so they pass. A count placeholder that resolves to
+    0 or 1 is refused too, wherever it is used: "1 accounts" is not a hook.
     """
-    def sub(text, where, strict, headline=False):
+    def sub(text, where, strict):
         if not isinstance(text, str):
             return text
 
@@ -1390,7 +1513,7 @@ def resolve_placeholders(cand, values, errors):
                                        if values else "none"))
                 return ""
             value = values[name]
-            if headline and isinstance(value, int) and value < 2:
+            if strict and isinstance(value, int) and value < 2:
                 errors.append("%s uses {%s}, which resolves to %d: a count that low is not a "
                               "hook, so leave the statistic out and say the same thing another "
                               "way" % (where, name, value))
@@ -1399,18 +1522,26 @@ def resolve_placeholders(cand, values, errors):
 
         out = PLACEHOLDER_RE.sub(rep, text)
         if strict:
+            # Everything a placeholder produced is exempt (the marks survive until the end of this
+            # function); the rest of the text may carry no number at all — not a digit run, not a
+            # spelled-out cardinal. Vague plurality ("several roles") is not a count and is checked
+            # per account in `check_gtm_named_counts`.
             masked = re.sub("%s[^%s]*%s" % (_MARK_OPEN, _MARK_CLOSE, _MARK_CLOSE), " ", out)
-            stray = sorted(set(re.findall(r"\d{2,}", masked)))
+            masked = re.sub(r"\b(?:several|multiple|more than one)\b", " ", masked, flags=re.I)
+            stray = sorted(set(re.findall(r"\d+", masked))
+                           | {m.group(0).lower() for m in NUMBER_WORD_RE.finditer(masked)})
             if stray:
-                errors.append("%s contains a number (%s) that no placeholder produced: use "
-                              "{n_accounts}, {n_multi}, {n_fetched} or {window_days} so the "
-                              "figure comes from the fetched rows"
-                              % (where, ", ".join(stray[:3])))
+                usable = [k for k in PLACEHOLDERS if k in values]
+                errors.append("%s contains a number (%s) that no placeholder produced: use %s so "
+                              "every figure comes from the fetched rows, and never a per-account "
+                              "count (the table's detail column carries it)"
+                              % (where, ", ".join(stray[:3]),
+                                 ", ".join("{%s}" % k for k in usable) or "a placeholder"))
         return re.sub("%s([^%s]*)%s" % (_MARK_OPEN, _MARK_CLOSE, _MARK_CLOSE), r"\1", out)
 
     out = dict(cand)
     for field in ("title", "thesis", "email_line"):
-        out[field] = sub(cand.get(field), field, True, True)
+        out[field] = sub(cand.get(field), field, True)
     findings = cand.get("findings")
     if isinstance(findings, list):
         rows = []
@@ -1429,6 +1560,67 @@ def resolve_placeholders(cand, values, errors):
         deliverable["summary"] = sub(deliverable.get("summary"), "deliverable.summary", False)
         out["deliverable"] = deliverable
     return out
+
+
+def check_gtm_copy(cand):
+    """The gtm_signal page is a skimmable card: headline, one lede, at most three findings, table.
+
+    Runs on the RESOLVED candidate, in the generation path only (`ground_gtm_candidate`,
+    `cmd_validate` of a bare candidate). It is deliberately not part of `validate_artifact` /
+    `scan_publish_safety`: an artifact that was already accepted keeps the shape it was accepted
+    with, and `publish` must never be re-blocked by a writing rule that changed afterwards.
+    Limitations and the summary are still carried in the JSON for honesty, but they are not
+    rendered, so they only need to be short.
+    """
+    limits, errors = GTM_COPY, []
+    title = cand.get("title") if isinstance(cand.get("title"), str) else ""
+    thesis = cand.get("thesis") if isinstance(cand.get("thesis"), str) else ""
+    line = cand.get("email_line") if isinstance(cand.get("email_line"), str) else ""
+    if len(title) > limits["title"]:
+        errors.append("title is %d characters after placeholders (max %d): the headline is read in "
+                      "one glance, so state what they get in plain words and name at most three "
+                      "accounts" % (len(title), limits["title"]))
+    hit = GTM_JARGON_RE.search(title)
+    if hit:
+        errors.append("title uses the jargon %r: say the value in plain words "
+                      "(e.g. \"15 fleets hiring driver recruiters right now\")" % hit.group(0))
+    if len(thesis) > limits["thesis"]:
+        errors.append("thesis is %d characters after placeholders (max %d): one sentence saying "
+                      "why this list matters to this employer"
+                      % (len(thesis), limits["thesis"]))
+    if re.search(r"[.!?]\s+\S", thesis):
+        errors.append("thesis is more than one sentence: the lede is a single sentence")
+    hit = GTM_META_RE.search(thesis)
+    if hit:
+        errors.append("thesis uses the meta phrase %r: say why the list matters to this employer "
+                      "instead of describing the artifact" % hit.group(0))
+    hit = GTM_JARGON_RE.search(line)
+    if hit:
+        errors.append("email_line uses the jargon %r: keep it plain and curiosity-driving"
+                      % hit.group(0))
+    findings = [f for f in (cand.get("findings") or []) if isinstance(f, dict)]
+    if len(findings) > limits["findings"]:
+        errors.append("findings has %d entries (max %d): the page shows three insights, so keep "
+                      "the three that matter" % (len(findings), limits["findings"]))
+    for i, f in enumerate(findings):
+        claim = f.get("claim") if isinstance(f.get("claim"), str) else ""
+        if len(claim) > limits["claim"]:
+            errors.append("findings[%d].claim is %d characters after placeholders (max %d): one "
+                          "specific, checkable line a lead understands in two seconds"
+                          % (i, len(claim), limits["claim"]))
+        hit = GTM_JARGON_RE.search(claim)
+        if hit:
+            errors.append("findings[%d].claim uses the jargon %r: plain words, the reader is a "
+                          "go-to-market lead" % (i, hit.group(0)))
+    limitations = [x for x in (cand.get("limitations") or []) if isinstance(x, str)]
+    if len(limitations) > limits["limitations"]:
+        errors.append("limitations has %d bullets (max %d): the short ones that matter"
+                      % (len(limitations), limits["limitations"]))
+    for i, lim in enumerate(limitations):
+        if len(lim.strip()) > limits["limitation"]:
+            errors.append("limitations[%d] is %d characters (max %d): keep each bullet short"
+                          % (i, len(lim.strip()), limits["limitation"]))
+    return errors
 
 
 # ---------------------------------------------------------------------------
@@ -1861,7 +2053,8 @@ def signal_cost(token=None):
     return {"cost_usd": spent, "treg_calls": len(calls)}
 
 
-def ground_gtm_candidate(conn, target, cand, label, token, signals, dry_run, loud):
+def ground_gtm_candidate(conn, target, cand, label, token, signals, dry_run, loud,
+                         trial=False, verdict=None):
     """Ground a gtm_signal candidate and resolve its placeholders.
 
     The account table is authored here (`rebuild_gtm_rows`): the candidate supplies the posting
@@ -1870,7 +2063,27 @@ def ground_gtm_candidate(conn, target, cand, label, token, signals, dry_run, lou
     Returns (candidate, exit_code). A None code means "carry on with this candidate"; any other
     value is the command's result: below the account minimum the honest outcome is an abstention
     (the fetch is paid for either way), above it a fabrication is a rejection.
+
+    With `trial=True` nothing is stored and nothing is printed: the outcome lands in `verdict`
+    (`status` one of abstained/rejected/store_problem, plus `errors`), which is how a near-miss can
+    be sent to one repair pass before the artifact is judged for good.
     """
+    def stop(status, errors, art=None):
+        if verdict is not None:
+            verdict.update({"status": status, "errors": list(errors)})
+        if trial:
+            return cand, (0 if status == "abstained" else 1)
+        if dry_run:
+            if status == "abstained":
+                print("pow: would abstain — %s (dry run, not stored)" % errors[0])
+                return cand, 0
+            return cand, _say_errors(errors, "%s (dry run, not stored)" % label, loud)
+        if status == "abstained":
+            return cand, record_abstain(conn, target, "gtm_signal", errors[0],
+                                        cost=signal_cost(token))
+        return cand, _reject(conn, target, "gtm_signal", art if art is not None else cand,
+                             errors, label, loud)
+
     path = signals_path_for(token=token, explicit=signals)
     if not token and path.endswith(".jsonl"):
         token = os.path.basename(path)[:-len(".jsonl")]
@@ -1879,9 +2092,7 @@ def ground_gtm_candidate(conn, target, cand, label, token, signals, dry_run, lou
     if err:
         errors = [err + ": gtm_signal rows may only come from a fetch, so run "
                          "`python pow.py signals ...` first (or point --signals at the store)"]
-        if dry_run:
-            return cand, _say_errors(errors, "%s (dry run, not stored)" % label, loud)
-        return cand, _reject(conn, target, "gtm_signal", cand, errors, label, loud)
+        return stop("store_problem", errors)
     cand, table_errors, table = rebuild_gtm_rows(cand, rows)
     errors, values, extra = ground_gtm(cand, rows, meta, target.get("company", ""))
     errors = table_errors + errors
@@ -1893,22 +2104,19 @@ def ground_gtm_candidate(conn, target, cand, label, token, signals, dry_run, lou
         reason = ("only %d qualified account row(s) could be grounded in the fetched postings "
                   "(an artifact needs %d); nothing was published"
                   % (len(extra["rows"]), GTM_MIN_ACCOUNTS))
-        if dry_run:
-            print("pow: would abstain — %s (dry run, not stored)" % reason)
-            return cand, 0
-        return cand, record_abstain(conn, target, "gtm_signal", reason,
-                                    cost=signal_cost(token))
+        return stop("abstained", [reason])
     if errors:
-        if dry_run:
-            return cand, _say_errors(errors, "%s (dry run, not stored)" % label, loud)
-        return cand, _reject(conn, target, "gtm_signal", cand, errors, label, loud)
+        return stop("rejected", errors)
     perrs = []
     resolved = resolve_placeholders(cand, values, perrs)
     if perrs:
-        if dry_run:
-            return cand, _say_errors(perrs, "%s (dry run, not stored)" % label, loud)
-        return cand, _reject(conn, target, "gtm_signal", cand, perrs, label, loud)
-    if not dry_run:
+        return stop("rejected", perrs)
+    # The page is a skimmable card, so the visible copy is judged here — in the generation path,
+    # after the counts are resolved — and never at publish time.
+    copy_errors = check_gtm_copy(resolved)
+    if copy_errors:
+        return stop("rejected", copy_errors, resolved)
+    if not dry_run and not trial:
         if table["rows"]:
             print("pow: authored accounts.csv from the fetched postings: %d row(s), one per "
                   "company, every cell computed and quoted by Python" % len(table["rows"]))
@@ -1919,25 +2127,37 @@ def ground_gtm_candidate(conn, target, cand, label, token, signals, dry_run, lou
 
 
 def accept_candidate(conn, target, recipe, cand, label, private_text="", dry_run=False,
-                     quiet=False, token=None, signals=None):
-    """Turn one candidate into a validated artifact, or refuse it with reasons. Returns an exit code."""
-    say = (lambda *a, **k: None) if quiet else print
+                     quiet=False, token=None, signals=None, verdict=None, trial=False,
+                     extra_details=None):
+    """Turn one candidate into a validated artifact, or refuse it with reasons. Returns an exit code.
+
+    `verdict` receives {"status": accepted|abstained|rejected|store_problem, "errors": [...]} so a
+    caller can act on a refusal instead of only reading it off the exit code. With `trial=True`
+    nothing is stored, recorded or printed: the same checks run and the verdict is all that comes
+    back, which is what the repair loop uses to decide whether a pass is worth its cost.
+    """
+    say = (lambda *a, **k: None) if (quiet or trial) else print
 
     def loud(msg):
-        print(msg)
+        if not trial:
+            print(msg)
+
+    def refuse(errors, art=None, status="rejected"):
+        if verdict is not None:
+            verdict.update({"status": status, "errors": list(errors)})
+        if trial:
+            return 1
+        return _reject(conn, target, recipe, art if art is not None else cand, errors, label, loud)
 
     if not isinstance(cand, dict):
-        return _reject(conn, target, recipe, cand, ["candidate is not a JSON object"],
-                       label, loud)
+        return refuse(["candidate is not a JSON object"])
     unknown = set(cand) - set(CANDIDATE_KEYS) - {"abstained", "reason", "recipe", "schema_version"}
     if unknown:
-        return _reject(conn, target, recipe, cand,
-                       ["candidate has unknown key(s): %s (the envelope is Python's)"
-                        % ", ".join(sorted(unknown))], label, loud)
+        return refuse(["candidate has unknown key(s): %s (the envelope is Python's)"
+                       % ", ".join(sorted(unknown))])
     if cand.get("recipe") and cand["recipe"] != recipe:
-        return _reject(conn, target, recipe, cand,
-                       ["candidate recipe %r does not match the routed recipe %r"
-                        % (cand["recipe"], recipe)], label, loud)
+        return refuse(["candidate recipe %r does not match the routed recipe %r"
+                       % (cand["recipe"], recipe)])
     # The fetch ledger is keyed by token; --signals names the same file, so the token is its stem.
     if not token:
         inferred = signals_path_for(token=None, explicit=signals)
@@ -1946,16 +2166,18 @@ def accept_candidate(conn, target, recipe, cand, label, private_text="", dry_run
     if cand.get("abstained") is True:
         reason = cand.get("reason")
         if not isinstance(reason, str) or len(reason.strip()) < 20:
-            return _reject(conn, target, recipe, cand,
-                           ["an abstention needs a `reason` of at least 20 characters"],
-                           label, loud)
+            return refuse(["an abstention needs a `reason` of at least 20 characters"])
+        if verdict is not None:
+            verdict.update({"status": "abstained", "errors": []})
+        if trial:
+            return 0
         return record_abstain(conn, target, recipe, reason.strip(), cost=signal_cost(token))
 
     # The signal fetch is the artifact's only source of account rows: ground before composing, so
     # nothing derived from an unfetched row can reach the envelope, the hash, or the page.
     if recipe == "gtm_signal":
         cand, code = ground_gtm_candidate(conn, target, cand, label, token, signals, dry_run,
-                                          loud)
+                                          loud, trial=trial, verdict=verdict)
         if code is not None:
             return code
 
@@ -2001,9 +2223,13 @@ def accept_candidate(conn, target, recipe, cand, label, private_text="", dry_run
     if not errors:
         errors.extend(scan_publish_safety(art, private_text))
     if errors:
-        if dry_run:
+        if dry_run and not trial:
             return _say_errors(errors, "%s (dry run, not stored)" % label, loud)
-        return _reject(conn, target, recipe, art, errors, label, loud)
+        return refuse(errors, art)
+    if verdict is not None:
+        verdict.update({"status": "accepted", "errors": []})
+    if trial:
+        return 0
     if dry_run:
         print("valid %s (%s) — not stored (dry run)" % (art["artifact_id"], recipe))
         return 0
@@ -2015,9 +2241,12 @@ def accept_candidate(conn, target, recipe, cand, label, private_text="", dry_run
     # Telemetry receives the EXACT posting URL (query tokens included) so a remote join can
     # identify the posting; pow_artifacts.url_key stays the normalized local join key. The signal
     # fetch's real spend rides on the same event, which is where pow_metrics reads cost from.
+    details = dict(signal_cost(token) or {})
+    if extra_details:
+        details.update(extra_details)
     P.record_event(conn, kind="generated", artifact_id=art["artifact_id"],
                    url_key=target["url"], cohort=cohort_for(P.now_iso()),
-                   details=signal_cost(token))
+                   details=details or None)
     say("  publish: python pow.py publish %s" % art["artifact_id"])
     print("accepted %s %s: %s" % (art["artifact_id"], recipe, art["title"]))
     return 0
@@ -2065,7 +2294,17 @@ def agent_budget():
         return 2.0
 
 
-def agent_command(recipe, budget=None):
+def omp_command():
+    """The omp executable, or an override command (`JOBHUNT_POW_OMP`, space-separated).
+
+    The override exists so a test (and an alternate install) can drive the agent step with another
+    binary; the smoke points it at a tiny fake that edits the candidate the way a model would.
+    """
+    override = (os.environ.get("JOBHUNT_POW_OMP") or "").strip()
+    return override.split() if override else ["omp"]
+
+
+def agent_command(recipe, budget=None, prompt=None):
     """The omp argv for one artifact pass: `--max-cost` is the cap, there is no wall-clock limit.
 
     `omp --max-cost` stops sending model requests once the session's spend reaches the value, and
@@ -2073,9 +2312,123 @@ def agent_command(recipe, budget=None):
     minute, so an expensive pass is stopped by money rather than by the clock.
     """
     cap = agent_budget() if budget is None else float(budget)
-    return ["omp", "-p", "--no-title", "--cwd", ROOT,
-            "--config", os.path.join(ROOT, "omp-pipeline.yml"),
-            "--max-cost=%.2f" % cap, agent_prompt(recipe)]
+    text = agent_prompt(recipe) if prompt is None else prompt
+    return omp_command() + ["-p", "--no-title", "--cwd", ROOT,
+                            "--config", os.path.join(ROOT, "omp-pipeline.yml"),
+                            "--max-cost=%.2f" % cap, text]
+
+
+def repair_passes():
+    """How many repair passes one generation may spend (pow.repair_passes, 0 disables)."""
+    try:
+        return max(0, int(cfg("repair_passes", 1)))
+    except (TypeError, ValueError):
+        return 1
+
+
+def repair_budget():
+    """The dollar cap for one repair pass (pow.repair_budget_usd)."""
+    try:
+        return max(0.0, float(cfg("repair_budget_usd", 1.0) or 0.0))
+    except (TypeError, ValueError):
+        return 1.0
+
+
+REPAIR_ENV = "JOBHUNT_POW_REPAIR"        # tells the child, and `pow.py signals`, that this is a repair
+
+
+def repair_mode_active():
+    """True while a repair pass runs: it may not spend money on new fetches."""
+    env = (os.environ.get(REPAIR_ENV) or "").strip().lower()
+    if env not in ("", "0", "false", "no"):
+        return True
+    task = S.read_json(P.task_file(), None)
+    return isinstance(task, dict) and task.get("repair") is True
+
+
+REPAIR_RULES_GTM = '''## The file is re-validated, so it must also satisfy the standing rules
+
+Your edit is judged by the same deterministic validator. Keep the candidate inside these rules so the
+fix does not simply move the failure:
+
+- `title` <= 70 characters, plain words, no jargon ("signals", "triggers", "operationalize").
+- `thesis` is ONE sentence, <= 140 characters, no meta phrases ("based on", "may indicate").
+- exactly three `findings`, each `claim` <= 140 characters, positive (no "none of...", "no X found"),
+  and no digit or spelled-out number in a claim: placeholders only.
+- `limitations` holds at most four short bullets; `accounts.csv` keeps its account rows — add none,
+  remove none, reorder none.
+- a name may only be a company the table shows, and `evidence_ids` may only name sources that exist.
+
+If the listed problem is only a syntax error, keep every value exactly as it is — unless a value
+breaks one of the rules above, in which case fix that value too, because it would be the very next
+refusal.
+'''
+
+
+def repair_prompt(recipe, cand_path, errors, note=""):
+    """The repair brief: the template plus the verbatim refusal and the file to edit in place."""
+    path = os.path.join(ROOT, "prompts", "pow-repair.md")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read()
+    except OSError:
+        text = "# Repair pass\n\nFix only the listed problems in the candidate file.\n"
+    if recipe == "gtm_signal":
+        text = text.rstrip() + "\n\n" + REPAIR_RULES_GTM
+    lines = [text.rstrip(), "", "## This repair pass", "",
+             "recipe: %s" % recipe,
+             "candidate file (edit THIS file in place; it is the only file you may touch):",
+             "  %s" % cand_path, ""]
+    if note:
+        lines += ["The file is not valid JSON at the moment.", note, ""]
+    lines.append("The deterministic validator refused it for exactly these reason(s):")
+    for err in errors[:20]:
+        lines.append("- %s" % err)
+    if len(errors) > 20:
+        lines.append("- … and %d more" % (len(errors) - 20))
+    lines += ["", "Fix exactly these. Do not add or remove accounts, do not change anything that "
+                  "is not listed, and do not run `pow.py signals`, any search, or any treg "
+                  "command: this pass may not fetch new data."]
+    return "\n".join(lines)
+
+
+def run_repair(recipe, cand_path, errors, note="", brief=None):
+    """One repair pass on a candidate file: budget-capped, and unable to spend on fetches.
+
+    Returns omp's exit code (-1 when omp is unavailable). `task.json` carries `repair: true`, the
+    candidate path and the posting brief while the pass runs, so the agent can re-validate its own
+    edits with `pow.py check`; `JOBHUNT_POW_REPAIR` is exported to the child, so even a disobedient
+    agent cannot call `pow.py signals` (it exits 2 without a request).
+    """
+    cap = min(agent_budget(), repair_budget())
+    cmd = agent_command(recipe, budget=cap,
+                        prompt=repair_prompt(recipe, cand_path, errors, note))
+    saved = S.read_json(P.task_file(), None)
+    task = dict(saved) if isinstance(saved, dict) else {}
+    if brief:
+        task.update(brief)
+    task.update({"repair": True, "candidate_path": cand_path.replace("\\", "/"), "recipe": recipe})
+    S.write_json(P.task_file(), task)
+    env = dict(os.environ)
+    env[REPAIR_ENV] = "1"
+    print("pow: repair pass on %s (max $%.2f of model spend, no fetches)"
+          % (os.path.relpath(cand_path, S.STATE).replace("\\", "/"), cap))
+    try:
+        proc = subprocess.run(cmd, cwd=ROOT, env=env, stdin=subprocess.DEVNULL,
+                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    except FileNotFoundError:
+        print("pow: omp is not installed; the candidate was not repaired.")
+        return -1
+    except OSError as ex:
+        print("pow: could not run the repair pass (%s)." % ex)
+        return -1
+    finally:
+        if isinstance(saved, dict):
+            S.write_json(P.task_file(), saved)
+    tail = _tail(proc.stdout, 1200)
+    if tail:
+        print(tail)
+    return proc.returncode
 
 
 def run_agent(recipe):
@@ -2206,6 +2559,11 @@ def _task_token():
 
 def cmd_signals(args):
     """Fetch postings for a gtm_signal artifact: the one place treg is called, under a hard budget."""
+    if repair_mode_active():
+        # A repair pass fixes the candidate; new data is not part of it, so no money is spent even
+        # if the agent asks. Same refusal whether it read the env var or the task brief.
+        print("pow signals: repair pass: no new fetches")
+        return 2
     token = _as_text(getattr(args, "token", "")) or _task_token()
     if not re.match(r"^[A-Za-z0-9]{6,64}$", token):
         print("pow: no signals token. Run `python pow.py generate --url …` (it writes "
@@ -2355,6 +2713,148 @@ def cmd_signals(args):
     return 0
 
 
+def read_candidate_file(path):
+    """(candidate, note): a candidate object, or the exact reason it could not be read.
+
+    A model writing JSON by hand slips once in a while (a stray ")" where "}" belonged). The note
+    carries the parser's own message with line and column plus the tail of the file, so a repair
+    pass can see what actually happened instead of guessing.
+    """
+    try:
+        with open(path, encoding="utf-8") as fh:
+            raw = fh.read()
+    except OSError as ex:
+        return None, ("cannot read %s (%s)" % (path, ex.strerror or ex))
+    try:
+        obj = json.loads(raw)
+    except ValueError as ex:
+        return None, ("the file is not valid JSON: %s. The last 200 characters are: %r"
+                      % (ex, raw[-200:]))
+    if not isinstance(obj, dict):
+        return None, ("the file is valid JSON but not an object (it is a %s). The last 200 "
+                      "characters are: %r" % (type(obj).__name__, raw[-200:]))
+    return obj, ""
+
+
+def trial_candidate(conn, target, recipe, cand, private, token, signals, label):
+    """Run the whole accept path without storing anything. Returns {"status", "errors"}."""
+    verdict = {"status": "rejected", "errors": ["the candidate was not judged"]}
+    accept_candidate(conn, target, recipe, cand, label, private, quiet=True, token=token,
+                     signals=signals, verdict=verdict, trial=True)
+    return verdict
+
+
+def repair_and_accept(conn, target, recipe, src_path, token, signals, private, label,
+                      quiet=False, dry_run=False):
+    """Trial a candidate, spend at most ONE repair pass on a near-miss, then judge it for good.
+
+    The repair edits a copy (`state/pow/candidates/<token>.repair.json`), so the file the agent
+    wrote — or the one an operator handed over — stays exactly as it was as evidence. The pass may
+    not fetch: `run_repair` marks the child, and `pow.py signals` refuses in that mode.
+    """
+    cand, note = read_candidate_file(src_path)
+    if cand is None:
+        verdict = {"status": "rejected", "errors": [note]}
+    else:
+        verdict = trial_candidate(conn, target, recipe, cand, private, token, signals, label)
+    first_errors = list(verdict.get("errors") or [])
+    repairs, second_errors = 0, []
+    if verdict.get("status") == "rejected" and repair_passes() > 0:
+        repair_path = P.pow_dir("candidates", "%s.repair.json" % token)
+        try:
+            shutil.copyfile(src_path, repair_path)
+        except OSError as ex:
+            print("pow: cannot copy %s for repair (%s)" % (src_path, ex))
+            return _reject(conn, target, recipe, cand if isinstance(cand, dict) else
+                           {"raw_candidate": None}, first_errors, label, print)
+        repairs = 1
+        store = os.path.abspath(signals) if signals else os.path.abspath(P.signals_file(token))
+        brief = {"posting_url": target["url"], "url_key": target["url_key"],
+                 "company": target["company"], "role": target["role"],
+                 "jd_file": target["jd_file"] or "",
+                 "signals_token": token, "signals_path": store}
+        rc = run_repair(recipe, os.path.abspath(repair_path), first_errors, note, brief=brief)
+        if rc != 0:
+            note2, cand2 = ("the repair pass did not finish (exit %s), so the file was not "
+                            "re-judged" % rc), None
+        else:
+            cand2, note2 = read_candidate_file(repair_path)
+        if cand2 is None:
+            second_errors = [note2]
+            verdict = {"status": "rejected", "errors": second_errors}
+        else:
+            cand = cand2
+            verdict = trial_candidate(conn, target, recipe, cand, private, token, signals, label)
+            second_errors = list(verdict.get("errors") or [])
+        if verdict.get("status") == "rejected":
+            # Both lists, so the operator sees what the first attempt got wrong and what the repair
+            # pass did with it. There is never a second repair.
+            combined = (["before the repair pass: %s" % e for e in first_errors]
+                        + ["after the repair pass: %s" % e for e in second_errors])
+            print("pow: the repair pass did not fix %s; nothing else was tried." % label)
+            return _reject(conn, target, recipe, cand if isinstance(cand, dict) else
+                           {"raw_candidate": None}, combined, label, print)
+        print("pow: the repaired candidate is valid (%d repair pass)" % repairs)
+    return accept_candidate(conn, target, recipe, cand, label, private, dry_run=dry_run,
+                            quiet=quiet, token=token, signals=signals,
+                            extra_details={"repair_passes": repairs})
+
+
+def cmd_check(args):
+    """Free, offline re-validation of the repair candidate: no store, no DB write, no agent, no treg.
+
+    Reads the brief `pow.py repair` wrote to task.json (`candidate_path`, `posting_url`, `company`,
+    `role`, `recipe`, `signals_token`/`signals_path`), runs exactly the trial the accepting path runs,
+    and prints `valid` or a numbered list of every refusal. Allowed while a repair pass runs — only
+    `pow.py signals` is refused there — so the repair agent can iterate on its own.
+    """
+    task = S.read_json(P.task_file(), None)
+    if not isinstance(task, dict):
+        print("pow: check needs the repair brief in state/pow/task.json (run --repair, or a "
+              "generation that reached its repair pass).")
+        return 2
+    path = _as_text(task.get("candidate_path"))
+    recipe = _as_text(task.get("recipe"))
+    url = _as_text(task.get("posting_url"))
+    company = _as_text(task.get("company"))
+    role = _as_text(task.get("role"))
+    missing = [k for k, v in (("candidate_path", path), ("posting_url", url),
+                              ("company", company), ("role", role), ("recipe", recipe)) if not v]
+    if missing:
+        print("pow: check: the task brief is missing %s; it is written by `pow.py repair` / "
+              "`generate --repair`." % ", ".join(missing))
+        return 2
+    if recipe not in P.RECIPES:
+        print("pow: check: unknown recipe %r in the task brief" % recipe)
+        return 2
+    if not os.path.isfile(path):
+        print("invalid: no candidate file at %s" % path)
+        return 1
+    target = {"url": url, "url_key": _as_text(task.get("url_key")) or P.url_key(url),
+              "company": company, "role": role, "jd_file": _as_text(task.get("jd_file"))}
+    cand, note = read_candidate_file(path)
+    if cand is None:
+        print("invalid (1 problem):")
+        print("  1. %s" % note)
+        return 1
+    verdict = {"status": "rejected", "errors": ["the candidate was not judged"]}
+    accept_candidate(None, target, recipe, cand, os.path.basename(path), jd_text(target),
+                     quiet=True, token=_as_text(task.get("signals_token")) or None,
+                     signals=_as_text(task.get("signals_path")) or None,
+                     verdict=verdict, trial=True)
+    if verdict.get("status") == "accepted":
+        print("valid: the artifact would be stored (recipe %s)" % recipe)
+        return 0
+    if verdict.get("status") == "abstained":
+        print("valid: this candidate abstains, which is a real outcome — nothing to fix")
+        return 0
+    errors = verdict.get("errors") or ["the candidate was refused without a reason"]
+    print("invalid (%d problem(s)):" % len(errors))
+    for i, err in enumerate(errors, 1):
+        print("  %d. %s" % (i, err))
+    return 1
+
+
 def cmd_generate(args):
     conn = P.db()
     try:
@@ -2389,6 +2889,25 @@ def cmd_generate(args):
             print("dry run: would run one omp pass capped at $%.2f of model spend, validate the "
                   "candidate, then store it. Nothing was called or written." % agent_budget())
             return 0
+
+        if getattr(args, "repair", False):
+            signals = getattr(args, "signals", None)
+            if not args.candidate:
+                print("pow: --repair needs --candidate FILE, the candidate to repair.")
+                return 2
+            if not signals:
+                print("pow: --repair needs --signals <token>.jsonl: the account evidence has to "
+                      "come from an existing store, because a repair pass may not fetch.")
+                return 2
+            token = os.path.basename(signals)[:-len(".jsonl")] if signals.endswith(".jsonl") else ""
+            if not re.match(r"^[A-Za-z0-9]{6,64}$", token):
+                print("pow: cannot read the signals token from %r (expected <token>.jsonl)."
+                      % signals)
+                return 2
+            print("pow: one repair pass over %s (no fetches allowed)" % args.candidate)
+            return repair_and_accept(conn, target, recipe, args.candidate, token, signals,
+                                     private, args.candidate, quiet=args.quiet,
+                                     dry_run=args.dry_run)
 
         if args.candidate:
             cand = S.read_json(args.candidate, None)
@@ -2434,8 +2953,7 @@ def cmd_generate(args):
                 "url_key": target["url_key"], "recipe": recipe, "status": "rejected",
                 "error": "the generation agent failed; no candidate was read"})
             return 1
-        cand = S.read_json(cand_path, None)
-        if cand is None:
+        if not os.path.isfile(cand_path):
             P.artifact_upsert(conn, {
                 "artifact_id": P.content_id(recipe, target["url_key"],
                                             {"failed": "no candidate", "token": token}),
@@ -2444,10 +2962,13 @@ def cmd_generate(args):
                          % os.path.relpath(cand_path, S.STATE)})
             print("pow: the agent wrote no candidate at %s" % cand_path)
             return 1
-        P.save_candidate(token, cand)
-        return accept_candidate(conn, target, recipe, cand,
-                                os.path.relpath(cand_path, S.STATE), private,
-                                dry_run=args.dry_run, quiet=args.quiet, token=token)
+        written, _note = read_candidate_file(cand_path)
+        if written is not None:
+            # The agent's own output stays exactly as written (the repair pass edits a copy).
+            P.save_candidate(token, written)
+        return repair_and_accept(conn, target, recipe, cand_path, token, None, private,
+                                 os.path.relpath(cand_path, S.STATE), quiet=args.quiet,
+                                 dry_run=args.dry_run)
     finally:
         conn.close()
 
@@ -2483,6 +3004,9 @@ def cmd_validate(args):
             perrs = []
             resolved = resolve_placeholders(obj, values, perrs)
             errors = table_errors + gerrs + perrs
+            if errors:
+                return _say_errors(errors, args.file)
+            errors = check_gtm_copy(resolved)
             if errors:
                 return _say_errors(errors, args.file)
             obj = resolved
@@ -2911,6 +3435,90 @@ def _fixture_source(sid, url, excerpt):
             "sha256": hashlib.sha256(excerpt.encode("utf-8")).hexdigest(), "excerpt": excerpt}
 
 
+SMOKE_FAKE_OMP = '''\
+"""A stand-in for `omp` in the smoke: edits the candidate like a model would, and logs each call."""
+import json
+import os
+import subprocess
+import sys
+
+state = os.environ.get("JOBHUNT_STATE") or "."
+with open(os.path.join(state, "pow", "task.json"), encoding="utf-8") as fh:
+    task = json.load(fh)
+path = task["candidate_path"]
+repair = task.get("repair") is True
+tmp = os.path.join(state, "pow", "tmp")
+os.makedirs(tmp, exist_ok=True)
+with open(os.path.join(tmp, "omp-calls.log"), "a", encoding="utf-8") as fh:
+    fh.write(("repair" if repair else "generate") + "\\n")
+mode = os.environ.get("JOBHUNT_POW_FAKE_MODE", "corrupt_then_fix")
+
+
+def read_env(name, default=""):
+    value = os.environ.get(name)
+    if not value:
+        return default
+    with open(value, encoding="utf-8") as fh:
+        return fh.read()
+
+
+valid = read_env("JOBHUNT_POW_FAKE_CANDIDATE")
+broken_content = read_env("JOBHUNT_POW_FAKE_CANDIDATE_BROKEN", valid)
+signals = os.environ.get("JOBHUNT_POW_FAKE_SIGNALS")
+if signals and task.get("signals_path"):
+    with open(signals, encoding="utf-8") as fh:
+        store = fh.read()
+    with open(task["signals_path"], "w", encoding="utf-8") as fh:
+        fh.write(store)
+
+
+def write(text):
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(text)
+
+
+def check():
+    """Run the real `pow.py check`, the way a repair agent would, and log what it said."""
+    proc = subprocess.run([sys.executable, os.environ["JOBHUNT_POW_FAKE_POW"], "check"],
+                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    out = proc.stdout.decode("utf-8", "replace")
+    first = out.strip().splitlines()[0] if out.strip() else ""
+    with open(os.path.join(tmp, "check-calls.log"), "a", encoding="utf-8") as fh:
+        fh.write("%d %s\\n" % (proc.returncode, first))
+    return out
+
+
+broken_syntax = (valid.rstrip()[:-1] + ")\\n") if valid.strip() else "{)\\n"
+if mode == "corrupt":
+    write(broken_syntax)
+elif mode == "corrupt_then_fix":
+    write(valid if repair else broken_syntax)
+elif mode == "corrupt_then_noop":
+    if not repair:
+        write(broken_syntax)
+elif mode == "abstain":
+    write(json.dumps({"abstained": True,
+                      "reason": "no public source describes this employer well enough"}))
+elif mode == "loop":
+    if repair:
+        write(broken_syntax)
+        out = check()                       # 1: the file does not parse
+        if "not valid JSON" in out:
+            write(broken_content)           # syntax fixed; the content error is now visible
+            out = check()                   # 2: it parses, and states a number nobody computed
+        if "invalid" in out:
+            write(valid)                    # 3: the claim itself was rewritten to be true
+            out = check()                   # 4: valid
+        print(out.strip())
+    else:
+        write(broken_syntax)
+elif mode == "loop_stuck":
+    write(broken_syntax)
+    if repair:
+        print(check().strip())
+print("fake omp: %s pass" % ("repair" if repair else "generate"))
+'''
+
 SMOKE_FETCHED_AT = "2026-11-04T12:00:00Z"
 SMOKE_WINDOW_DAYS = 21
 
@@ -3005,50 +3613,37 @@ def _gtm_candidate(rows=None, **overrides):
                          r["ats"]])
         sources.append(_fixture_source("acct-%d" % index_of[company], r["url"], r["excerpt"]))
     cand = {
-        "title": "{n_accounts} fleets posted driver recruiting roles in {window_days} days, "
-                 "{n_ats_match} on your ats partners",
-        "thesis": "These are {n_accounts} us fleets hiring driver recruiters right now, with "
-                  "{n_multi} of them staffing more than one recruiting seat, so a product that "
-                  "reads postings has live demand to route instead of a market estimate.",
+        "title": "{n_accounts} fleets hiring driver recruiters right now, incl. Acme Freight",
+        "thesis": "These are {n_accounts} us fleets hiring driver recruiters now, so a tool that "
+                  "reads postings sees live demand instead of a market estimate.",
         "sources": sources,
         "findings": [
-            {"id": "method",
-             "claim": "method: fetched {n_fetched} postings across {n_companies} companies for "
-                      "the title keywords {titles} inside a {window_days}-day window, and kept "
-                      "the {n_accounts} accounts whose posting is a buyer-side trigger.",
-             "evidence_ids": ["buyers", "acct-1"],
-             "limitations": "One fetch, one day; the keywords are the search, not a census."},
             {"id": "f1",
-             "claim": "{n_multi} of {n_accounts} accounts are hiring for more than one "
-                      "recruiting or safety seat at once, which reads as a team build-out rather "
-                      "than a single backfill.",
+             "claim": "{n_recent_3d} of these {n_accounts} fleets posted this week, including "
+                      "Acme Freight and Ironline Logistics.",
              "evidence_ids": ["acct-1", "acct-2"],
              "limitations": "A snapshot of open postings, not a headcount change."},
             {"id": "f2",
-             "claim": "{n_ats_match} of the accounts post on greenhouse, lever, ashby, icims or "
-                      "workday, the vendors this company lists as integration partners.",
-             "evidence_ids": ["partners", "acct-4"],
-             "limitations": "The ATS is inferred from the posting URL."},
+             "claim": "{n_multi} of {n_accounts} are staffing more than one seat, so this is a "
+                      "build-out rather than a backfill.",
+             "evidence_ids": ["acct-1", "acct-2"],
+             "limitations": "Multiple postings do not establish distinct seats."},
             {"id": "f3",
-             "claim": "Every account below posted a driver recruiting role inside the "
-                      "{window_days}-day window, so the list is open demand today rather than a "
-                      "historic pattern.",
-             "evidence_ids": ["acct-1", "acct-9"],
-             "limitations": ""},
+             "claim": "Every kept posting is a driver-facing recruiting or safety role at a real "
+                      "operator, not an agency listing.",
+             "evidence_ids": ["buyers", "acct-4"],
+             "limitations": "Role titles alone do not establish a vendor decision."},
         ],
         "deliverable": {
-            "summary": "One CSV of fleets with a hiring trigger taken from the fetched postings, "
-                       "sorted strongest signal first: account, the posting title that fired, the "
-                       "public URL as evidence, how many seats are open, the posted date and the "
-                       "ATS the URL reveals. The page is the list plus the reading of it, not a "
-                       "market study.",
+            "summary": "One table: the fleet, the recruiting role it posted, the public posting "
+                       "link, open seats, the posted date and the ats. The list, not a study.",
             "files": [{"path": "accounts.csv", "language": "csv", "content": buf.getvalue()}],
         },
         "limitations": ["A hiring signal is not buying intent: the list shows demand, not budget.",
                         "This is a sample of one fetch, not a census of the market.",
                         "Every row is a public posting read on one day, so it can close tomorrow."],
         "email_line": "pulled {n_accounts} fleets that posted driver recruiter roles in the last "
-                      "{window_days} days, {n_ats_match} on your ats partners:",
+                      "{window_days} days, incl. acme freight:",
     }
     cand.update(overrides)
     return cand
@@ -3307,6 +3902,37 @@ def cmd_smoke(args):
         except Exception as ex:  # noqa: BLE001
             return ("error", str(ex))
 
+    def artifact_of(text):
+        """The artifact a command's stdout names, plus its id ({} when none was stored)."""
+        aid = next((t for t in text.split() if t.startswith("p_") and len(t) == 26), "")
+        path = os.path.join(scratch, "pow", "artifacts", "%s.json" % aid)
+        if not aid or not os.path.isfile(path):
+            return {}, aid
+        with open(path, encoding="utf-8") as fh:
+            return json.load(fh), aid
+
+    def store_rows(token_name):
+        path = os.path.join(scratch, "pow", "signals", "%s.jsonl" % token_name)
+        if not os.path.isfile(path):
+            return []
+        with open(path, encoding="utf-8") as fh:
+            return [json.loads(line) for line in fh if line.strip()]
+
+    def age_table(token_rows):
+        """(freshest age, rows inside three days) over the first posting of each company.
+
+        Ages are relative to each row's own fetch stamp, which is when `signals` stored it — not
+        to the fixture constant.
+        """
+        seen_c, ages = set(), []
+        for r in token_rows:
+            if r["company"] in seen_c:
+                continue
+            seen_c.add(r["company"])
+            ages.append((datetime.date.fromisoformat(r["fetched_at"][:10])
+                         - datetime.date.fromisoformat(_posted_date(r))).days)
+        return (min(ages) if ages else 0), sum(1 for a in ages if a <= 3)
+
     url = "https://jobs.example.com/acme/gtm-engineer"
     stub = _StubHost()
     try:
@@ -3353,13 +3979,9 @@ def cmd_smoke(args):
             if r["company"] not in companies:
                 companies.append(r["company"])
         n_accounts = len(companies)
-        first_at = {}
         by_company = {}
         for r in rows:
-            first_at.setdefault(r["company"], r["ats"])
             by_company.setdefault(r["company"], []).append(r)
-        partners = [v for v in ("greenhouse", "lever", "ashby", "icims", "workday")]
-        n_ats = sum(1 for c in companies if first_at[c] in partners)
 
         fixture("gtm.json", _gtm_candidate(rows))
         fixture("fde.json", _fde_candidate())
@@ -3425,28 +4047,39 @@ def cmd_smoke(args):
         check(r and r[1] == "accepted", "gtm artifact stored as accepted", r)
         gtm_art = json.load(open(os.path.join(scratch, "pow", "artifacts", "%s.json" % gtm_id),
                                  encoding="utf-8")) if gtm_id else {}
-        want_title = ("%d fleets posted driver recruiting roles in %d days, %d on your ats "
-                      "partners" % (n_accounts, SMOKE_WINDOW_DAYS, n_ats))
+        want_title = ("%d fleets hiring driver recruiters right now, incl. Acme Freight"
+                            % n_accounts)
         want_line = ("pulled %d fleets that posted driver recruiter roles in the last %d days, "
-                     "%d on your ats partners:" % (n_accounts, SMOKE_WINDOW_DAYS, n_ats))
+                     "incl. acme freight:" % (n_accounts, SMOKE_WINDOW_DAYS))
         claims = " ".join(str(f.get("claim")) for f in (gtm_art.get("findings") or []))
         check(gtm_art.get("title") == want_title and gtm_art.get("email_line") == want_line
               and "{" not in claims and gtm_art.get("thesis", "").find("{") < 0,
               "placeholders resolve to counts computed from the stored rows",
               "%r / %r / %r" % (gtm_art.get("title"), gtm_art.get("email_line"), claims))
+        art_findings = [f for f in (gtm_art.get("findings") or []) if isinstance(f, dict)]
+        check(len(gtm_art.get("title", "")) <= GTM_COPY["title"]
+              and len(gtm_art.get("thesis", "")) <= GTM_COPY["thesis"]
+              and len(gtm_art.get("email_line", "")) <= GTM_COPY["email_line"]
+              and len(art_findings) <= GTM_COPY["findings"]
+              and len(gtm_art.get("limitations") or []) <= GTM_COPY["limitations"]
+              and all(len(f.get("claim", "")) <= GTM_COPY["claim"] for f in art_findings)
+              and not GTM_JARGON_RE.search(gtm_art.get("title", ""))
+              and not any(GTM_JARGON_RE.search(f.get("claim", "")) for f in art_findings)
+              and not re.search(r"[.!?]\s+\S", gtm_art.get("thesis", "")),
+              "the accepted page fits every visible-copy limit (headline, lede, findings)",
+              "%r / %r / %r" % (gtm_art.get("title"), gtm_art.get("thesis"),
+                                [f.get("claim") for f in art_findings]))
         check("accounts.csv" == ((gtm_art.get("deliverable") or {}).get("files") or [{}])[0]
               .get("path"), "accounts.csv is deliverable.files[0]",
               (gtm_art.get("deliverable") or {}).get("files"))
-        method = next((f for f in (gtm_art.get("findings") or [])
-                       if str(f.get("id")) == "method"), {})
-        method_claim = str(method.get("claim") or "")
-        check(("%d postings across %d companies" % (len(stored_rows), len(companies)))
-              in method_claim
-              and "driver recruiter, fleet safety manager" in method_claim
-              and ("%d-day window" % SMOKE_WINDOW_DAYS) in method_claim
-              and ("kept the %d accounts" % n_accounts) in method_claim,
-              "the method finding states the filter and funnel from the fetch ledger",
-              method_claim)
+        # Findings are the product now: no method finding is demanded or expected, and the visible
+        # ones are the accounts' own value (recency, concentration, role mix).
+        check(len(art_findings) == 3
+              and not any(str(f.get("id")) == "method" for f in art_findings)
+              and any("posted this week" in str(f.get("claim")) for f in art_findings)
+              and any("more than one seat" in str(f.get("claim")) for f in art_findings),
+              "findings carry the value, with no method finding required",
+              [f.get("claim") for f in art_findings])
         conn = import_db()
         try:
             ev = conn.execute("SELECT details_json FROM pow_events WHERE kind='generated' "
@@ -3477,15 +4110,17 @@ def cmd_smoke(args):
         check(rc == 1 and "is not in this token's signal store" in out,
               "a row absent from the fetch is refused", out)
 
-        # 1b2. the method finding is required: the page must state the rule that produced the pack
+        # 1b2. no method finding is required: findings are the value, and this candidate has none
         nomethod = _gtm_candidate(rows)
-        nomethod["findings"] = [f for f in nomethod["findings"] if f["id"] != "method"]
         fixture("nomethod.json", nomethod)
         rc, out = child("generate", "--url", "https://jobs.example.com/acme/nm",
                         "--company", "Acme", "--role", "GTM Engineer", "--recipe", "gtm_signal",
                         "--candidate", files["nomethod.json"], "--signals", signal_file)
-        check(rc == 1 and "METHOD finding" in out,
-              "a pack without a method finding is refused", out)
+        nm_art, nm_id = artifact_of(out)
+        check(rc == 0 and nm_id
+              and len(nm_art.get("findings") or []) == 3
+              and not any(str(f.get("id")) == "method" for f in nm_art.get("findings") or []),
+              "a candidate with no method finding is accepted", out)
 
         # 1c. an invented number in the headline is refused (only placeholders may produce counts)
         invented = _gtm_candidate(rows, title="%d fleets hiring driver recruiters this week"
@@ -3499,6 +4134,8 @@ def cmd_smoke(args):
 
         # 1c2. a placeholder that cannot be derived is refused, not rendered as zero
         nopartners = _gtm_candidate(rows)
+        nopartners["findings"][1]["claim"] = ("{n_ats_match} of these accounts post on an ats "
+                                              "this company lists.")
         nopartners["sources"] = [
             _fixture_source("buyers", "https://www.example.com/customers",
                             "Fleet and logistics operators read driver hiring demand from their "
@@ -3614,53 +4251,58 @@ def cmd_smoke(args):
         stale = _gtm_candidate(rows)
         stale["findings"] = list(stale["findings"][:2]) + [
             {"id": "stale", "claim": "A finding that cites an account source no kept row has.",
-             "evidence_ids": ["acct-11"], "limitations": ""}]
+             "evidence_ids": ["buyers", "acct-11"], "limitations": ""}]
         fixture("stale.json", stale)
         rc, out = child("generate", "--url", "https://jobs.example.com/acme/stale",
                         "--company", "Acme", "--role", "GTM Engineer", "--recipe", "gtm_signal",
                         "--candidate", files["stale.json"], "--signals", signal_file)
-        check(rc == 1 and "acct-11" in out and "unknown source" in out,
-              "a finding citing a pruned account source is refused by id", out)
+        stale_art, stale_id = artifact_of(out)
+        stale_kept = [s["id"] for s in (stale_art.get("sources") or [])
+                      if _as_text(s.get("id")).startswith("acct-")]
+        stale_finding = next((f for f in (stale_art.get("findings") or [])
+                              if str(f.get("id")) == "stale"), {})
+        check(rc == 0 and stale_id and stale_kept
+              and set(stale_finding.get("evidence_ids") or [])
+              == set(stale_kept) | {"buyers"},
+              "a finding citing a pruned acct id is repaired, keeping valid employer ids",
+              out + " / " + str(stale_finding))
 
-        def artifact_of(text):
-            aid = next((t for t in text.split() if t.startswith("p_") and len(t) == 26), "")
-            path = os.path.join(scratch, "pow", "artifacts", "%s.json" % aid)
-            if not aid or not os.path.isfile(path):
-                return {}, aid
-            with open(path, encoding="utf-8") as fh:
-                return json.load(fh), aid
+        # 1h3. a finding with no evidence ids at all is given every kept row's source
+        noids = _gtm_candidate(rows)
+        noids["findings"][2] = dict(noids["findings"][2], evidence_ids=[])
+        fixture("noids.json", noids)
+        rc, out = child("generate", "--url", "https://jobs.example.com/acme/noids",
+                        "--company", "Acme", "--role", "GTM Engineer", "--recipe", "gtm_signal",
+                        "--candidate", files["noids.json"], "--signals", signal_file)
+        noids_art, noids_id = artifact_of(out)
+        noids_kept = [s["id"] for s in (noids_art.get("sources") or [])
+                      if _as_text(s.get("id")).startswith("acct-")]
+        noids_findings = noids_art.get("findings") or []
+        noids_finding = noids_findings[2] if len(noids_findings) > 2 else {}
+        check(rc == 0 and noids_id and noids_kept
+              and set(noids_finding.get("evidence_ids") or []) == set(noids_kept),
+              "a finding with no evidence ids is given every kept row's source",
+              out + " / " + str(noids_finding))
 
-        def store_rows(token_name):
-            path = os.path.join(scratch, "pow", "signals", "%s.jsonl" % token_name)
-            if not os.path.isfile(path):
-                return []
-            with open(path, encoding="utf-8") as fh:
-                return [json.loads(line) for line in fh if line.strip()]
+        # 1i. the hook: a title may name kept accounts, and real recency is computable. The store's
+        # dates are shifted so the freshest kept posting is two days old relative to the fetch (a 1
+        # or a 0 in the headline would be refused, and old dates would fall out of the window).
+        today = datetime.date.today()
+        newest = max(datetime.date.fromisoformat(r["date_posted"][:10])
+                     for r in SMOKE_SIGNAL_RESULTS)
 
-        def age_table(token_rows):
-            """(freshest age, rows inside three days) over the first posting of each company.
+        def dated_store(name, age_of_newest):
+            delta = (today - datetime.timedelta(days=age_of_newest)) - newest
+            raw_rows = []
+            for raw in SMOKE_SIGNAL_RESULTS:
+                r = dict(raw)
+                day = datetime.date.fromisoformat(r["date_posted"][:10]) + delta
+                r["date_posted"] = day.isoformat() + r["date_posted"][10:]
+                raw_rows.append(r)
+            fixture(name, {"results": raw_rows, "cost_usd": 0.0015, "cursor": None})
+            return raw_rows
 
-            Ages are relative to each row's own fetch stamp, which is when `signals` stored it —
-            not to the fixture constant.
-            """
-            seen_c, ages = set(), []
-            for r in token_rows:
-                if r["company"] in seen_c:
-                    continue
-                seen_c.add(r["company"])
-                ages.append((datetime.date.fromisoformat(r["fetched_at"][:10])
-                             - datetime.date.fromisoformat(_posted_date(r))).days)
-            return (min(ages) if ages else 0), sum(1 for a in ages if a <= 3)
-
-        # 1i. the hook: a title may name kept accounts, and real recency is computable. The store is
-        # shifted one day back so the freshest kept posting is two days old (a 1 would be refused).
-        shifted = []
-        for raw in SMOKE_SIGNAL_RESULTS:
-            r = dict(raw)
-            day = datetime.date.fromisoformat(r["date_posted"][:10]) - datetime.timedelta(days=1)
-            r["date_posted"] = day.isoformat() + r["date_posted"][10:]
-            shifted.append(r)
-        fixture("treg-shifted.json", {"results": shifted, "cost_usd": 0.0015, "cursor": None})
+        dated_store("treg-shifted.json", 2)
         shift_token = "shift" + token
         rc, out = child("signals", "--token", shift_token, "--titles", "driver recruiter",
                         "--days", str(SMOKE_WINDOW_DAYS), "--countries", "US",
@@ -3669,8 +4311,8 @@ def cmd_smoke(args):
         want_fresh, want_recent = age_table(shift_rows)
         shift_signals = os.path.join(scratch, "pow", "signals", "%s.jsonl" % shift_token)
         hook = _gtm_candidate(shift_rows)
-        hook["title"] = ("{n_accounts} fleets, including Northline Logistics and Cedar Valley "
-                         "Freight, opened driver-recruiter roles in the last {freshest_days} days")
+        hook["title"] = ("{n_accounts} fleets hiring driver recruiters, incl. Cedar Valley "
+                         "Freight")
         hook["email_line"] = ("pulled {n_accounts} fleets that posted driver recruiting roles in "
                               "the last {freshest_days} days, {n_recent_3d} of them this week:")
         fixture("hook.json", hook)
@@ -3679,25 +4321,15 @@ def cmd_smoke(args):
                         "--candidate", files["hook.json"], "--signals", shift_signals)
         hook_art, _hook_id = artifact_of(out)
         check(rc == 0 and want_fresh >= 2
-              and ("in the last %d days" % want_fresh) in str(hook_art.get("title", ""))
-              and "Northline Logistics" in str(hook_art.get("title", ""))
+              and ("in the last %d days" % want_fresh) in str(hook_art.get("email_line", ""))
+              and "Cedar Valley Freight" in str(hook_art.get("title", ""))
               and ("%d of them this week" % want_recent) in str(hook_art.get("email_line", "")),
-              "a title may name kept accounts and state the computed recency",
+              "a title may name kept accounts and the lede may state the computed recency",
               out + " / " + str(hook_art.get("title")))
 
         # 1i2. a headline count that resolves to 0 or 1 is refused (no "1 accounts"). The store is
         # shifted so its freshest posting is exactly one day older than the fetch stamp.
-        today = datetime.date.today()
-        newest = max(datetime.date.fromisoformat(r["date_posted"][:10])
-                     for r in SMOKE_SIGNAL_RESULTS)
-        delta = (today - datetime.timedelta(days=1)) - newest
-        fresh_raw = []
-        for raw in SMOKE_SIGNAL_RESULTS:
-            r = dict(raw)
-            day = datetime.date.fromisoformat(r["date_posted"][:10]) + delta
-            r["date_posted"] = day.isoformat() + r["date_posted"][10:]
-            fresh_raw.append(r)
-        fixture("treg-fresh1.json", {"results": fresh_raw, "cost_usd": 0.0015, "cursor": None})
+        dated_store("treg-fresh1.json", 1)
         fresh_token = "fresh" + token
         child("signals", "--token", fresh_token, "--titles", "driver recruiter",
               "--days", str(SMOKE_WINDOW_DAYS), "--countries", "US",
@@ -3747,7 +4379,10 @@ def cmd_smoke(args):
               "--days", str(SMOKE_WINDOW_DAYS), "--countries", "US",
               "--fixture", files["treg-linked.json"])
         link_signals = os.path.join(scratch, "pow", "signals", "%s.jsonl" % link_token)
-        fixture("ats1.json", _gtm_candidate(store_rows(link_token)))
+        ats1 = _gtm_candidate(store_rows(link_token))
+        ats1["findings"][1]["claim"] = ("{n_ats_match} of these accounts post on an ats this "
+                                        "company lists.")
+        fixture("ats1.json", ats1)
         rc, out = child("generate", "--url", "https://jobs.example.com/acme/ats1",
                         "--company", "Acme", "--role", "GTM Engineer", "--recipe", "gtm_signal",
                         "--candidate", files["ats1.json"], "--signals", link_signals)
@@ -3756,8 +4391,7 @@ def cmd_smoke(args):
 
         # 1i5. a name on the page has to be an account the page shows
         unknown = _gtm_candidate(rows)
-        unknown["title"] = ("{n_accounts} fleets, including Uber Freight, opened driver-recruiter "
-                            "roles in the last {window_days} days")
+        unknown["title"] = "{n_accounts} fleets hiring driver recruiters, incl. Uber Freight"
         fixture("unknown.json", unknown)
         rc, out = child("generate", "--url", "https://jobs.example.com/acme/name1",
                         "--company", "Acme", "--role", "GTM Engineer", "--recipe", "gtm_signal",
@@ -3765,8 +4399,7 @@ def cmd_smoke(args):
         check(rc == 1 and "not one of the kept account rows" in out,
               "a company name that is not a kept row is refused", out)
         dropped = _gtm_candidate([r for r in rows if r["company"] != "Acme Freight"])
-        dropped["title"] = ("{n_accounts} fleets, including Acme Freight, opened driver-recruiter "
-                            "roles in the last {window_days} days")
+        dropped["title"] = "{n_accounts} fleets hiring driver recruiters, incl. Acme Freight"
         fixture("dropped.json", dropped)
         rc, out = child("generate", "--url", "https://jobs.example.com/acme/name2",
                         "--company", "Acme", "--role", "GTM Engineer", "--recipe", "gtm_signal",
@@ -3791,11 +4424,297 @@ def cmd_smoke(args):
               "Python keeps the candidate's row order (strongest signal first)",
               out + " / " + str(order_rows[:2]))
 
-        # 2. an ungrounded claim is refused
+        # 1j. the visible copy is a skimmable card: short headline, no jargon, three findings max
+        long_title = _gtm_candidate(rows)
+        long_title["title"] = ("{n_accounts} fleets in the us hiring driver recruiters this week, "
+                               "incl. Acme Freight and Northline Logistics, all taken from public "
+                               "job postings")
+        fixture("long_title.json", long_title)
+        rc, out = child("generate", "--url", "https://jobs.example.com/acme/long",
+                        "--company", "Acme", "--role", "GTM Engineer", "--recipe", "gtm_signal",
+                        "--candidate", files["long_title.json"], "--signals", signal_file)
+        check(rc == 1 and ("max %d" % GTM_COPY["title"]) in out and "title is" in out,
+              "a headline over the length limit is refused, with the limit named", out)
+
+        jargon = _gtm_candidate(rows)
+        jargon["title"] = "{n_accounts} fleet hiring signals appeared this week"
+        fixture("jargon.json", jargon)
+        rc, out = child("generate", "--url", "https://jobs.example.com/acme/jargon",
+                        "--company", "Acme", "--role", "GTM Engineer", "--recipe", "gtm_signal",
+                        "--candidate", files["jargon.json"], "--signals", signal_file)
+        check(rc == 1 and "jargon" in out and "signals" in out,
+              "a headline that uses jargon is refused", out)
+
+        crowded = _gtm_candidate(rows)
+        crowded["findings"] = list(crowded["findings"]) + [
+            {"id": "f3", "claim": "Every kept posting is inside the window, so this is open demand.",
+             "evidence_ids": ["acct-1"], "limitations": ""}]
+        fixture("crowded.json", crowded)
+        rc, out = child("generate", "--url", "https://jobs.example.com/acme/crowded",
+                        "--company", "Acme", "--role", "GTM Engineer", "--recipe", "gtm_signal",
+                        "--candidate", files["crowded.json"], "--signals", signal_file)
+        check(rc == 1 and ("max %d" % GTM_COPY["findings"]) in out and "findings has 4" in out,
+              "more than three findings is refused", out)
+
+        wordy = _gtm_candidate(rows)
+        wordy["findings"][0]["claim"] = (
+            "{n_recent_3d} of these fleets posted a driver recruiting or fleet safety role inside "
+            "the window, and each account is hiring across more than one location, which is the "
+            "kind of detail a whole week of research would otherwise be needed to assemble")
+        fixture("wordy.json", wordy)
+        rc, out = child("generate", "--url", "https://jobs.example.com/acme/wordy",
+                        "--company", "Acme", "--role", "GTM Engineer", "--recipe", "gtm_signal",
+                        "--candidate", files["wordy.json"], "--signals", signal_file)
+        check(rc == 1 and "findings[0].claim is" in out
+              and ("max %d" % GTM_COPY["claim"]) in out,
+              "a finding over the claim length limit is refused", out)
+
+        # 1k. numbers are placeholders only, in findings and the lede too
+        spelled = _gtm_candidate(rows)
+        spelled["findings"][1]["claim"] = ("Acme Freight posted four driver recruiter openings this "
+                                           "week.")
+        fixture("spelled.json", spelled)
+        rc, out = child("generate", "--url", "https://jobs.example.com/acme/spelled",
+                        "--company", "Acme", "--role", "GTM Engineer", "--recipe", "gtm_signal",
+                        "--candidate", files["spelled.json"], "--signals", signal_file)
+        check(rc == 1 and "contains a number (four)" in out and "{n_accounts}" in out,
+              "a spelled-out cardinal in a finding is refused with the placeholder hint", out)
+
+        typed = _gtm_candidate(rows)
+        typed["findings"][1]["claim"] = "Acme Freight posted 4 driver recruiter openings this week."
+        fixture("typed.json", typed)
+        rc, out = child("generate", "--url", "https://jobs.example.com/acme/typed",
+                        "--company", "Acme", "--role", "GTM Engineer", "--recipe", "gtm_signal",
+                        "--candidate", files["typed.json"], "--signals", signal_file)
+        check(rc == 1 and "contains a number (4)" in out,
+              "a typed digit in a finding is refused", out)
+
+        thesis_num = _gtm_candidate(rows)
+        thesis_num["thesis"] = ("Fifteen fleets are hiring driver recruiters now, so a tool that "
+                                "reads postings sees live demand.")
+        fixture("thesis_num.json", thesis_num)
+        rc, out = child("generate", "--url", "https://jobs.example.com/acme/thesisnum",
+                        "--company", "Acme", "--role", "GTM Engineer", "--recipe", "gtm_signal",
+                        "--candidate", files["thesis_num.json"], "--signals", signal_file)
+        check(rc == 1 and "thesis contains a number (fifteen)" in out,
+              "a spelled-out cardinal in the lede is refused", out)
+
+        ordinal = _gtm_candidate(rows)
+        ordinal["findings"][0]["claim"] = ("Acme Freight posted a driver recruiter role on November "
+                                           "fourth.")
+        fixture("ordinal.json", ordinal)
+        rc, out = child("generate", "--url", "https://jobs.example.com/acme/ordinal",
+                        "--company", "Acme", "--role", "GTM Engineer", "--recipe", "gtm_signal",
+                        "--candidate", files["ordinal.json"], "--signals", signal_file)
+        check(rc == 0, "an ordinal in a finding is not treated as a count", out)
+
+        vague = _gtm_candidate(rows)
+        vague["findings"][2]["claim"] = ("Acme Freight posted several driver recruiter openings this "
+                                         "week.")
+        fixture("vague.json", vague)
+        rc, out = child("generate", "--url", "https://jobs.example.com/acme/vague",
+                        "--company", "Acme", "--role", "GTM Engineer", "--recipe", "gtm_signal",
+                        "--candidate", files["vague.json"], "--signals", signal_file)
+        check(rc == 1 and "the fetch returned 1 posting(s)" in out,
+              "a vague 'several' overstates a single-posting account and is refused", out)
+
+        vague_ok = _gtm_candidate(rows)
+        vague_ok["findings"][2]["claim"] = ("Ironline Logistics posted several driver recruiter roles "
+                                            "this month.")
+        fixture("vague_ok.json", vague_ok)
+        rc, out = child("generate", "--url", "https://jobs.example.com/acme/vagueok",
+                        "--company", "Acme", "--role", "GTM Engineer", "--recipe", "gtm_signal",
+                        "--candidate", files["vague_ok.json"], "--signals", signal_file)
+        check(rc == 0, "'several' is allowed for an account the fetch shows with two postings", out)
+
+        richer = _gtm_candidate(rows)
+        richer["findings"][2]["claim"] = ("{n_roles_total} postings behind these {n_accounts} "
+                                          "accounts, at most {max_roles} at a single operator")
+        fixture("richer.json", richer)
+        rc, out = child("generate", "--url", "https://jobs.example.com/acme/richer",
+                        "--company", "Acme", "--role", "GTM Engineer", "--recipe", "gtm_signal",
+                        "--candidate", files["richer.json"], "--signals", signal_file)
+        rich_art, rich_id = artifact_of(out)
+        rich_claim = str(((rich_art.get("findings") or [{}])[2]).get("claim") or "")
+        check(rc == 0 and (
+            "%d postings behind these %d accounts, at most %d at a single operator"
+            % (len(stored_rows), n_accounts, 2)) == rich_claim,
+              "the new role-count placeholders resolve to computed counts", out + " / " + rich_claim)
+
+        # 1L. the repair loop: one short pass over a copy, never two, and never a fetch
+        fake = os.path.join(scratch, "fakeomp.py")
+        with open(fake, "w", encoding="utf-8") as fh:
+            fh.write(SMOKE_FAKE_OMP)
+        call_log = os.path.join(scratch, "pow", "tmp", "omp-calls.log")
+
+        def fake_env(mode, extra=None):
+            env2 = {"JOBHUNT_POW_OMP": "%s %s" % (PY, fake),
+                    "JOBHUNT_POW_FAKE_CANDIDATE": files["gtm.json"],
+                    "JOBHUNT_POW_FAKE_SIGNALS": signal_file,
+                    "JOBHUNT_POW_FAKE_MODE": mode}
+            env2.update(extra or {})
+            return env2
+
+        def omp_calls():
+            if not os.path.isfile(call_log):
+                return []
+            with open(call_log, encoding="utf-8") as fh:
+                return [ln.strip() for ln in fh if ln.strip()]
+
+        rc, out = child("generate", "--url", "https://jobs.example.com/acme/repair1",
+                        "--company", "Acme", "--role", "GTM Engineer", "--recipe", "gtm_signal",
+                        env=fake_env("corrupt_then_fix"))
+        rep1_art, rep1_id = artifact_of(out)
+        check(rc == 0 and rep1_id and omp_calls() == ["generate", "repair"]
+              and "repair pass" in out and "the repaired candidate is valid" in out,
+              "a corrupt candidate gets exactly one repair pass and is then accepted",
+              out + str(omp_calls()))
+
+        with open(call_log, "w", encoding="utf-8"):
+            pass
+        rc, out = child("generate", "--url", "https://jobs.example.com/acme/repair2",
+                        "--company", "Acme", "--role", "GTM Engineer", "--recipe", "gtm_signal",
+                        env=fake_env("corrupt_then_noop"))
+        check(rc == 1 and omp_calls() == ["generate", "repair"]
+              and "before the repair pass:" in out and "after the repair pass:" in out
+              and "not valid JSON" in out,
+              "a candidate that still fails is rejected with both error lists, never repaired twice",
+              out + str(omp_calls()))
+
+        with open(call_log, "w", encoding="utf-8"):
+            pass
+        rc, out = child("generate", "--url", "https://jobs.example.com/acme/repair3",
+                        "--company", "Acme", "--role", "GTM Engineer", "--recipe", "gtm_signal",
+                        env=fake_env("corrupt_then_fix",
+                                     {"JOBHUNT_POW_CONFIG": json.dumps({"repair_passes": 0})}))
+        check(rc == 1 and omp_calls() == ["generate"] and "repair pass" not in out,
+              "pow.repair_passes 0 disables the repair pass", out + str(omp_calls()))
+
+        task_file = os.path.join(scratch, "pow", "task.json")
+        saved_task = b""
+        if os.path.isfile(task_file):
+            with open(task_file, "rb") as fh:
+                saved_task = fh.read()
+        with open(task_file, "w", encoding="utf-8") as fh:
+            json.dump({"repair": True, "signals_token": "repairblock"}, fh)
+        rc, out = child("signals", "--token", "repairblock", "--titles", "driver recruiter",
+                        "--days", "21", "--fixture", files["treg.json"],
+                        env={"JOBHUNT_POW_REPAIR": "1"})
+        rc2, out2 = child("signals", "--token", "repairblock", "--titles", "driver recruiter",
+                          "--days", "21", "--fixture", files["treg.json"])
+        with open(task_file, "wb") as fh:
+            fh.write(saved_task)
+        check(rc == 2 and "repair pass: no new fetches" in out
+              and rc2 == 2 and "repair pass: no new fetches" in out2,
+              "pow.py signals refuses during a repair pass (env var and task flag)", out + out2)
+
+        with open(call_log, "w", encoding="utf-8"):
+            pass
+        rc, out = child("generate", "--url", "https://jobs.example.com/acme/repair4",
+                        "--company", "Acme", "--role", "GTM Engineer", "--recipe", "gtm_signal",
+                        env=fake_env("abstain"))
+        check(rc == 0 and "abstained" in out and omp_calls() == ["generate"],
+              "an abstention triggers no repair pass", out + str(omp_calls()))
+
+        # the operator path: one repair pass over an existing rejected candidate, on a copy
+        before = open(files["invented.json"], "rb").read()
+        rc, out = child("generate", "--url", "https://jobs.example.com/acme/repair5",
+                        "--company", "Acme", "--role", "GTM Engineer", "--recipe", "gtm_signal",
+                        "--force", "--candidate", files["invented.json"],
+                        "--signals", signal_file, "--repair", env=fake_env("corrupt_then_fix"))
+        rep5_art, rep5_id = artifact_of(out)
+        repair_copy = os.path.join(scratch, "pow", "candidates",
+                                   "%s.repair.json" % os.path.basename(signal_file)[:-6])
+        check(rc == 0 and rep5_id and os.path.isfile(repair_copy)
+              and open(files["invented.json"], "rb").read() == before
+              and "repair pass" in out,
+              "--repair fixes a copy of an operator's candidate and leaves the original intact",
+              out + " / copy=%s" % os.path.isfile(repair_copy))
+
+        # 1M. the repair pass loops on `pow.py check` until it prints valid — dollars are the only bound
+        check_log = os.path.join(scratch, "pow", "tmp", "check-calls.log")
+
+        def check_calls():
+            if not os.path.isfile(check_log):
+                return []
+            with open(check_log, encoding="utf-8") as fh:
+                return [ln.split(" ", 1) for ln in fh.read().splitlines() if ln.strip()]
+
+        with open(call_log, "w", encoding="utf-8"):
+            pass
+        if os.path.isfile(check_log):
+            os.remove(check_log)
+        rc, out = child("generate", "--url", "https://jobs.example.com/acme/loop1",
+                        "--company", "Acme", "--role", "GTM Engineer", "--recipe", "gtm_signal",
+                        env=fake_env("loop", {"JOBHUNT_POW_FAKE_POW": os.path.abspath(__file__),
+                                              "JOBHUNT_POW_FAKE_CANDIDATE_BROKEN":
+                                                  files["invented.json"]}))
+        loop_art, loop_id = artifact_of(out)
+        loop_checks = check_calls()
+        check(rc == 0 and loop_id and omp_calls() == ["generate", "repair"]
+              and len(loop_checks) >= 2 and loop_checks[-1][0] == "0"
+              and loop_checks[-1][1].startswith("valid")
+              and "the repaired candidate is valid" in out,
+              "the repair agent loops on pow.py check (syntax first, then content) until valid",
+              out + str(loop_checks))
+
+        with open(call_log, "w", encoding="utf-8"):
+            pass
+        if os.path.isfile(check_log):
+            os.remove(check_log)
+        rc, out = child("generate", "--url", "https://jobs.example.com/acme/loop2",
+                        "--company", "Acme", "--role", "GTM Engineer", "--recipe", "gtm_signal",
+                        env=fake_env("loop_stuck",
+                                     {"JOBHUNT_POW_FAKE_POW": os.path.abspath(__file__)}))
+        stuck_checks = check_calls()
+        check(rc == 1 and omp_calls() == ["generate", "repair"]
+              and "before the repair pass:" in out and "after the repair pass:" in out
+              and bool(stuck_checks) and stuck_checks[-1][0] == "1",
+              "an agent that never reaches valid is rejected with both lists",
+              out + str(stuck_checks))
+
+        # `pow.py check` is allowed during a repair and touches nothing
+        task_path = os.path.join(scratch, "pow", "task.json")
+        saved_task = b""
+        if os.path.isfile(task_path):
+            with open(task_path, "rb") as fh:
+                saved_task = fh.read()
+        brief = {"recipe": "gtm_signal", "posting_url": url, "url_key": P.url_key(url),
+                 "company": "Acme", "role": "GTM Engineer", "jd_file": "",
+                 "candidate_path": files["gtm.json"], "signals_path": signal_file,
+                 "signals_token": token, "repair": True}
+        with open(task_path, "w", encoding="utf-8") as fh:
+            json.dump(brief, fh)
+
+        def pow_tree():
+            return sorted(os.path.join(b, n)
+                          for b, _dirs, names in os.walk(os.path.join(scratch, "pow"))
+                          for n in names)
+
+        def artifact_count():
+            conn = import_db()
+            try:
+                return conn.execute("SELECT COUNT(*) FROM pow_artifacts").fetchone()[0]
+            finally:
+                conn.close()
+
+        before_files, before_rows = pow_tree(), artifact_count()
+        rc, out = child("check", env={"JOBHUNT_POW_REPAIR": "1"})
+        after_files, after_rows = pow_tree(), artifact_count()
+        with open(task_path, "wb") as fh:
+            fh.write(saved_task)
+        check(rc == 0 and "valid" in out and before_files == after_files
+              and before_rows == after_rows,
+              "pow.py check is allowed during a repair pass and writes nothing",
+              out + "files %d→%d, artifacts %d→%d"
+              % (len(before_files), len(after_files), before_rows, after_rows))
+
+        # 2. an unknown non-acct evidence id is not repaired: it names a page nobody declared
         rc, out = child("generate", "--url", url, "--company", "Acme", "--role", "GTM Engineer",
                         "--recipe", "gtm_signal", "--candidate", files["bad.json"], "--force",
                         "--signals", signal_file)
-        check(rc == 1 and "unknown source" in out, "ungrounded claim rejected", out)
+        check(rc == 1 and "unknown source" in out and "nope" in out,
+              "an unknown non-acct evidence id is still refused", out)
 
         # 3. honest abstention is stored, not fabricated
         rc, out = child("generate", "--url", "https://jobs.example.com/acme/ops-engineer",
@@ -3903,6 +4822,43 @@ def cmd_smoke(args):
               "a verified republish stores the published state with the canonical hash",
               out + str(r))
 
+        # 10b. the copy limits are a writing rule, not a publication gate: an artifact accepted
+        # before the card layout (long headline, two-sentence lede, four findings, six bullets)
+        # still publishes.
+        legacy = json.loads(json.dumps(gtm_art))
+        legacy_id = "p" + hashlib.sha256(b"legacy-copy-shape").hexdigest()[:24]
+        legacy["artifact_id"] = legacy_id
+        legacy["posting_url"] = "https://jobs.example.com/acme/legacy"
+        legacy["title"] = ("A legacy headline written before the card layout, kept exactly as it was "
+                           "accepted back then")
+        legacy["thesis"] = legacy["thesis"] + " A second sentence the new lede rule refuses."
+        legacy["findings"] = list(legacy["findings"]) + [
+            {"id": "f4", "claim": "A fourth finding the three-line cap refuses today.",
+             "evidence_ids": ["acct-1"], "limitations": ""}]
+        legacy["limitations"] = list(legacy["limitations"]) + [
+            "A fifth bullet the four-bullet cap refuses today.",
+            "A sixth bullet, also fine for a stored artifact."]
+        legacy_path = os.path.join(scratch, "pow", "artifacts", "%s.json" % legacy_id)
+        with open(legacy_path, "w", encoding="utf-8") as fh:
+            json.dump(legacy, fh)
+        conn = import_db()
+        try:
+            conn.execute("INSERT OR REPLACE INTO pow_artifacts (artifact_id, url_key, recipe, "
+                         "status, artifact_path, content_sha256, created_at, updated_at) "
+                         "VALUES (?,?,?,?,?,?,?,?)",
+                         (legacy_id, P.url_key(legacy["posting_url"]), "gtm_signal", "accepted",
+                          "pow/artifacts/%s.json" % legacy_id,
+                          hashlib.sha256(P.canonical_bytes(legacy)).hexdigest(),
+                          P.now_iso(), P.now_iso()))
+            conn.commit()
+        finally:
+            conn.close()
+        rc, out = child("publish", legacy_id, "--base", stub.base, "--key-file", key_file,
+                        env={"JOBHUNT_POW_CONFIG": enabled})
+        r = row(legacy_id)
+        check(rc == 0 and r and r[1] == "published",
+              "an artifact accepted before the copy limits still publishes", out + str(r))
+
         # 11. attach: guarded by the local runs row (posting match), then recorded
         conn = import_db()
         try:
@@ -4007,6 +4963,8 @@ def main(argv=None):
     g.add_argument("--jd-file", help="job description text, for the private-text leak check")
     g.add_argument("--signals", help="signal file to ground a gtm_signal candidate against "
                                      "(default: state/pow/signals/<token>.jsonl)")
+    g.add_argument("--repair", action="store_true",
+                   help="run ONE repair pass over --candidate (needs --signals; no fetches)")
     g.add_argument("--force", action="store_true", help="regenerate although an artifact exists")
     g.add_argument("--dry-run", action="store_true")
     g.add_argument("--quiet", action="store_true")
@@ -4082,12 +5040,15 @@ def main(argv=None):
     sm = sub.add_parser("smoke", help="offline end-to-end scenario (temp DB, stub host)")
     sm.add_argument("--keep", action="store_true")
 
+    sub.add_parser("check", help="free, offline re-validation of the repair candidate")
+
     sub.add_parser("__eval")
 
     args = ap.parse_args(argv)
     if args.cmd == "__eval":
         return cmd_eval_step()
     handlers = {"generate": cmd_generate, "validate": cmd_validate, "signals": cmd_signals,
+                "check": cmd_check,
                 "run": cmd_run,
                 "publish": cmd_publish, "attach": cmd_attach, "revoke": cmd_revoke,
                 "status": cmd_status, "reconcile": cmd_reconcile, "daily": cmd_daily,

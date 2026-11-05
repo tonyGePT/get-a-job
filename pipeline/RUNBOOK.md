@@ -153,6 +153,9 @@ python C:/tmp/jobharness/pipeline/pow.py signals --dry-run --titles T --days N  
 python C:/tmp/jobharness/pipeline/pow.py validate FILE --url U --company C --role R --recipe R
 python C:/tmp/jobharness/pipeline/pow.py generate --url U --candidate FILE --signals FILE  # hand-written candidate
                                        # (--signals / JOBHUNT_POW_SIGNALS = the store it must be grounded in)
+python C:/tmp/jobharness/pipeline/pow.py generate --url U --candidate FILE --signals STORE --repair
+                                       # ONE repair pass over a copy, no fetches, then re-validate
+python C:/tmp/jobharness/pipeline/pow.py check   # free/offline: re-validate the repair candidate (from task.json)
 python C:/tmp/jobharness/pipeline/pow.py run <artifact_id>   # ai_eval: built-in evaluator
 python C:/tmp/jobharness/pipeline/pow.py run <artifact_id> --execute         # FDE code, opt-in
 python C:/tmp/jobharness/pipeline/pow.py publish <artifact_id>               # needs pow.publish_enabled
@@ -252,6 +255,21 @@ A paused readout: `Last Result 0` is success; `JobHuntWatchdog` writes
   whatever candidate the agent had written, and only a failed pass (any other nonzero code) is recorded as rejected;
   `state/pow/.lock` stops two passes at once. There is no wall-clock limit on the agent. Only applications with
   `status='submitted' AND confirmed=1` are eligible — nothing is inferred from a draft or a skipped stage.
+- **PoW spends at most one repair pass on a near-miss; inside it the agent loops on its own, and it cannot fetch.**
+  After the agent pass the candidate is trialled (all checks, nothing stored). If it is unreadable JSON or fails
+  validation/grounding — not an abstention, not a missing store, not a spent budget — `pow.py` runs ONE repair pass
+  (`pow.repair_passes`, default 1; set 0 to disable) with `prompts/pow-repair.md`, capped at
+  `min(pow.repair_budget_usd, pow.agent_budget_usd)` (defaults $1.00 / $2.00 — dollars are the only bound: no step
+  count, no timeout), on a **copy** at `state/pow/candidates/<token>.repair.json` so the agent's file stays as
+  evidence. Inside that pass the agent edits, runs the free offline `pow.py check` (the accepting path in trial mode:
+  `valid` or every numbered error, no writes, no DB, no treg, no agent), reads all of the errors and repeats until
+  `valid` or out of budget — a syntax error masks the content errors behind it, so one blind fix is not enough. The
+  child is marked (`JOBHUNT_POW_REPAIR`, `repair: true` in `task.json`), so `pow.py signals` exits 2 with
+  `repair pass: no new fetches` and the pass cannot spend treg money whatever the model decides. Then the copy is
+  re-read and re-judged by Python itself (the agent's word is never trusted): accepted → stored, with `repair_passes`
+  recorded on the `generated` event; still failing → `rejected` with both error lists (`before the repair pass:` /
+  `after the repair pass:`) and no second pass. The operator can run the same pass by hand:
+  `pow.py generate … --candidate FILE --signals <token>.jsonl --repair`.
 - **PoW's `gtm_signal` rows come from a paid fetch, and Python owns the money.** `pow.py signals` is the only place
   `pow.py` calls a provider: `blitzapi.jobs.search` (BlitzAPI `POST /v2/jobs/search` via treg's proxy) at
   **$0.000495 per returned job row** (`max_results` 1-50, cursor paginated, an empty page is free). The token is the
@@ -267,21 +285,39 @@ A paused readout: `Last Result 0` is success; `JobHuntWatchdog` writes
   `detail` the computed open-role count, `posted` the fetched date inside the window, `ats` what the URL reveals —
   and written by the `csv` module, so a stray comma or a retyped date cannot reach the page. Row order is the
   candidate's (strongest signal first), one row per company, and the `acct-<n>` sources are regenerated from the store
-  (an acct source no kept row refers to is pruned, and a finding citing one fails as an unknown source). An URL the
-  fetch never returned is refused. Headline figures are
+  (an acct source no kept row refers to is pruned, and `repair_gtm_evidence` then re-points any finding that cited it
+  at the kept rows — see the evidence bullet below). An URL the
+  fetch never returned is refused. Figures are
   placeholders (`{n_accounts}`, `{n_multi}`, `{window_days}`, `{freshest_days}`, `{n_recent_3d}`,
-  `{n_ats_match}`, and for the method finding `{n_fetched}`, `{n_companies}`, `{titles}`) substituted by Python from
-  the validated rows and the fetch ledger; a typed two-digit number in `title`/`thesis`/`email_line`/a claim is
-  refused, as is a pack with no METHOD finding (the one claim that states the trigger, the funnel and the keywords
-  that ran). Three more rules make the page worth opening rather than merely true. **Depth:** the prompt demands at
-  least three differently-aimed searches and 12-20 kept accounts (8 is the floor, else abstain), and `signals` prints
-  the pool and the spend after every call so the agent can see it grow. **The hook:** `title`/`thesis`/`email_line` may
+  `{n_recent_7d}`, `{n_roles_total}`, `{max_roles}`, with `{n_fetched}`, `{n_companies}`, `{titles}` and
+  `{n_ats_match}` as optional extras) substituted by Python from the validated rows and the fetch ledger, and
+  nothing else may supply a number in `title`/`thesis`/`email_line`/a finding claim: a digit of any length and a
+  spelled-out cardinal ("four", "a dozen") are both refused (ordinals are words, not counts — "November fourth"
+  passes, "Nov 4" does not), and a placeholder that resolves to 0 or 1 is refused wherever it is used. A
+  per-account count cannot be expressed at all (the `detail` column carries it), and a "several/multiple
+  postings" claim attached to a named account is checked against that account's fetched count
+  (`check_gtm_named_counts`). The published page renders only the title, one lede sentence, the findings and the
+  table, so the visible
+  copy is a writing rule (`check_gtm_copy`, applied in `ground_gtm_candidate` and in `cmd_validate` of a bare
+  candidate ONLY): title ≤70 characters with no jargon ("signals", "triggers", "operationalize"), thesis one sentence
+  ≤140 with no meta phrases, three findings ≤140 each (the first is the single most useful takeaway; evidence ids stay
+  in the JSON but are not rendered), and ≤4 short limitations (required in the JSON for honesty, not rendered).
+  `deliverable.summary` is not capped — nothing renders it. **Evidence ids are Python's too**
+  (`repair_gtm_evidence`): a finding keeps the ids that resolve, and an `acct-<n>` that no longer exists — or an empty
+  list — is replaced with every kept row's account source plus the employer pages the agent cited; an unknown
+  non-`acct` id is still refused, so the artifact stays grounded. **There is no method finding any more** — nothing
+  demands `{n_fetched}`/`{n_companies}`/
+  `{titles}`, and a candidate without them is accepted. `validate_artifact` and `scan_publish_safety` are untouched by
+  those limits, so an artifact accepted earlier keeps its shape and still publishes (the smoke proves it with a
+  legacy-shaped artifact). The rules that make the page worth opening rather than merely true remain. **Depth:** the
+  prompt demands at least three differently-aimed searches and 12-20 kept accounts (8 is the floor, else abstain), and
+  `signals` prints the pool and the spend after every call. **The hook:** `title`/`thesis`/`email_line`/findings may
   name kept accounts, and Python refuses a company-shaped name (carrying a designator such as `Logistics`, `Freight`,
   `Inc.`) that is not the employer, an integration partner or a kept row, plus any fetched company the pack dropped; a
-  placeholder that resolves to 0 or 1 in the headline is refused ("1 accounts" is not a hook); `{n_ats_match}` only
-  exists from two matching rows up, and the ATS is never the hook because the postings are mostly LinkedIn URLs.
-  **Findings are positive:** a claim that states an absence ("none of the URLs reveals…", "no partner was found") is
-  refused, and the prompt sends that material to `limitations`.
+  placeholder that resolves to 0 or 1 is refused wherever it is used ("1 accounts" is not a hook). **Findings are
+  positive:** a claim that states an absence ("none of the URLs reveals…", "no partner was found") is refused, and the
+  prompt sends that material to `limitations`. ATS is not part of the recipe: the `ats` column stays and is computed
+  from the posting URL, but nothing in the prompt asks for an ATS angle.
   Below 8 grounded accounts the candidate becomes an **abstention** with the count, and a `gtm_signal` candidate with
   no signal store is refused outright. A rejected candidate whose URLs and agent prose are sound can be re-run without
   a new agent pass: `pow.py generate --url U --company C --role R --recipe gtm_signal --candidate <file> --signals
@@ -329,10 +365,10 @@ abstention is a decision, not a bug.
   "3+ roles in one window" board heuristic do most of the filtering. For PoW signals neither runs: `signals` passes
   `company.is_agency: false` and narrows with `--icp-keywords`/`--sizes`, and the agent is told to drop staffing
   agencies, boards and the employer's own competitors by hand before writing `accounts.csv`.
-- PoW signal postings are mostly LinkedIn URLs, so `ats` is often empty and `{n_ats_match}` is usually too small to
-  sell. The placeholder therefore only exists from two matching rows up (one match is refused as unavailable), the
-  prompt tells the agent not to mention ATS in the hook at all otherwise, and the `ats` column stays only as a table
-  column filled from the posting URL's host. A zero is honest, not a bug — it is just not the hook.
+- PoW signal postings are mostly LinkedIn URLs, so the `ats` column is often empty. ATS is no longer part of the
+  recipe at all: the column stays (filled from the posting URL's host when it is an ATS, else blank) and the prompt
+  never asks for an ATS angle. `{n_ats_match}` still resolves when at least two rows match a partner vendor named on
+  the employer pages, and is simply unavailable otherwise.
 - PoW publish/attach/revoke/reconcile need the private TraceHire worker and its key file; generation, validation and
   the built-in evaluator are offline, and `pow.py smoke` covers the whole flow (including a fixture `treg` response)
   against a local stub.
@@ -359,6 +395,52 @@ abstention is a decision, not a bug.
 
 ## State history
 
+- 2026-11-05 (v2.7): the repair pass now loops on the validator instead of fixing one blind round. New free offline
+  command `pow.py check`: it reads the repair brief from `state/pow/task.json` (candidate path, posting, company, role,
+  recipe, signal store), runs the accepting path in trial mode — no writes, no DB, no treg, no agent — and prints
+  `valid` or a numbered list of every refusal, exit 0/1. It is allowed under `JOBHUNT_POW_REPAIR` (only `signals` is
+  refused), so the repair prompt tells the agent to edit, run `pow.py check`, read ALL errors, fix and repeat until
+  valid or out of budget (dollars are still the only bound), and to finish by printing the last `check` output. Still
+  one repair pass per generation, and Python's own trial after it makes the final decision; `pow.repair_budget_usd`
+  default rose to 1.00 because the pass iterates. No table or column changed.
+- 2026-11-05 (v2.6): a near-miss candidate gets ONE short repair pass instead of a whole regeneration. After the
+  agent pass (or over an operator's `--candidate` with `--repair`) the candidate is trialled with every check and
+  nothing stored; if it is unreadable JSON or fails validation/grounding — not an abstention, not a missing store —
+  `pow.py` runs `prompts/pow-repair.md` with the verbatim error list (for corrupt JSON the parser message with
+  line/column and the last 200 characters) against a **copy** at `state/pow/candidates/<token>.repair.json`, capped at
+  `min(pow.repair_budget_usd, pow.agent_budget_usd)` and marked (`JOBHUNT_POW_REPAIR`, `repair: true` in `task.json`)
+  so `pow.py signals` exits 2 with `repair pass: no new fetches`. Accepted after the pass → stored with
+  `repair_passes` on the `generated` event; still failing → `rejected` with both error lists and no second attempt. New
+  config keys `pow.repair_passes` (default 1, 0 disables) and `pow.repair_budget_usd` (default 1.00); new
+  `JOBHUNT_POW_OMP` env override so the smoke can drive the agent step with a fake. No table or column changed.
+- 2026-11-05 (v2.5): numbers are placeholders only, everywhere the reader can see. The digit rule covered
+  `title`/`email_line` with two-or-more digits and missed both single digits and spelled-out cardinals, so an
+  accepted finding claimed "Maersk posted four driver recruiter openings" over a store with one Maersk posting.
+  Now `title`, `thesis`, `email_line` and every finding claim reject any digit run and any cardinal word
+  ("four", "a dozen", "twenty"), with placeholder-produced spans exempt; ordinals are words, not counts. A
+  placeholder that resolves to 0 or 1 is refused wherever it is used. New computed placeholders
+  `{n_roles_total}`, `{n_recent_7d}` and `{max_roles}` give the agent true ways to talk about scale and
+  recency, and `check_gtm_named_counts` verifies a vague "several/multiple postings" claim attached to a named
+  account against that account's fetched count (a per-account count cannot be stated at all; the `detail`
+  column carries it). No table or column changed.
+- 2026-11-05 (v2.4): Python owns the evidence ids of a `gtm_signal` finding. A real candidate was rejected only
+  because it numbered `acct-<n>` itself while `rebuild_gtm_rows` numbers those from store position — and readers never
+  see the ids, so that cost an agent pass for nothing. `repair_gtm_evidence` now runs in `ground_gtm`: a finding keeps
+  the ids that resolve, and an id naming a pruned/unknown `acct-<n>` (or an empty list) is replaced with every kept
+  row's account source plus the employer pages the agent cited; an unknown non-`acct` id is still refused. The prompt
+  tells the agent to cite only employer source ids (or none). The `deliverable.summary` ≤160 rule was dropped: nothing
+  renders the summary. No table or column changed.
+- 2026-11-05 (v2.3): the hosted page was cut down to what a lead skims — title, one lede sentence, findings, table —
+  and the artifact followed. **The METHOD finding requirement is gone**: no claim has to state the funnel or the
+  keywords, `{n_fetched}`/`{n_companies}`/`{titles}` stay as optional computed placeholders, and a candidate without
+  them is accepted. Findings are the product: three lines, ≤140 characters each, plain and positive, ordered with the
+  most useful takeaway first; they may name kept accounts (the name check now covers claims too). New compose-time copy
+  rules (`check_gtm_copy`, generation paths only) cap title ≤70, thesis to one sentence ≤140 and limitations ≤4 short
+  bullets, and refuse jargon ("signals", "triggers", "operationalize"). Limitations stay
+  required in the JSON for honesty even though the page no longer renders them, and ATS guidance was removed from the
+  prompt (the `ats` column and its computation remain). `validate_artifact`/`scan_publish_safety` were deliberately left
+  alone so an already-accepted artifact keeps its shape and still publishes; the smoke proves that with a
+  legacy-shaped artifact. No table or column changed.
 - 2026-11-05 (v2.2): the `gtm_signal` recipe was made to produce something a GTM lead would click, after the first
   live pack (8 accounts from one treg call) was valid but weak. The prompt now demands at least three
   differently-aimed searches (title variants, a 7-day and a 21-day window, ICP filters), targets 12-20 kept accounts
