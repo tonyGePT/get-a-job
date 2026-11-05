@@ -8,7 +8,7 @@ steps (qualify, apply), so a bad model call cannot corrupt state.
 ```mermaid
 flowchart LR
   D[discover<br/>Python] --> Q[qualify<br/>LLM agent] --> P[prepare<br/>Python] --> A[apply<br/>LLM agent + browser]
-  A --> V[verify<br/>Python + Gmail] --> T[trace<br/>optional] --> G[digest<br/>Python]
+  A --> V[verify<br/>Python + Gmail] --> T[trace<br/>optional] --> G[digest<br/>Python] --> R[retro<br/>Python + review agent]
 ```
 
 ## Read this first: this is one person's Windows tool, published as a starting point
@@ -183,11 +183,24 @@ the author's Windows ops log (`C:/` paths, Task Scheduler, dated incidents): **w
 | verify | `verify.py` | matches Gmail receipts to applications; anything unproven is downgraded to `unverified` | `state.db` |
 | extension | `trace.py` (private, not published) | optional post-verify stage; skipped when the file is absent | `state.db` |
 | digest | `digest.py` | one markdown summary, optionally posted to Discord | `state/digest-<date>.md` |
+| retro | `retro.py` (after digest, in-process) | telemetry, one review agent pass, gated and revertible self-healing changes | `state/retro-<date>.md`, `state.db` |
 
 `state/state.db` (SQLite) is the source of truth. `python pipeline/ledger.py check|list|add|outreach|lead|resume-change`
 reads and appends to it, including applications you made by hand. A day with zero candidates still runs verify, trace and
 digest. A failed stage stops the run but still sends a digest. A lock file prevents overlapping runs. There are **no agent
 timeouts**: a hung agent blocks that day's run until you kill it.
+
+## Post-run retro (self-healing)
+
+After digest, `daily.py` runs `retro.py --in-process` (non-fatal, `required=False`). Python computes the day's telemetry (funnel, per-stage tokens and cost, skip reasons, apply outcomes, stage durations) into `state/retro-<date>-brief.md`. One `omp -p` pass with `prompts/retro.md` reads it and proposes changes. The agent edits nothing itself: `retro.py` owns every mutation.
+
+- **Allowlist.** Changes may touch only files in `RETRO_WRITABLE`. `RETRO_FORBIDDEN` blocks `profile/`, `config.json`, `state/`, `trace.py`, resume files and answer files. Code and prompt changes are unified diffs, applied with `difflib` and then `py_compile`-checked (the file and every module importing it) or prompt-section-checked.
+- **Data-only changes** (blocklist, discover regexes, ATS hints) are merged by Python into `state/blocklist.json`, `state/discover-overrides.json` and `state/ats-hints.json`. `discover.py` and `prompts/apply.md` read them; absent files are a no-op.
+- **Grading and revert.** Each change keeps a `.retro-bak` copy and is graded over the next 2 runs. A better KPI marks it verified; a KPI worse by 5% reverts it (backup, else `git checkout`, else drop the data entry). History is in the `retro_runs` and `retro_actions` tables of `state.db`.
+- **Retro cost is excluded from the pipeline KPI** (reported as `kpi.retro_cost_usd`), so the reviewer cannot inflate its own metric.
+- **Config.** The `retro` block in `config.example.json` (`enabled`, `agent_timeout_seconds`, `grace_runs`, ...) and an optional `notify.retro_webhook_file` for its own Discord digest.
+- **CLI.** `python pipeline/retro.py [--status|--dry-run|--no-agent|--backfill N|--digest|--day D]`.
+- **Porting.** It is an omp touchpoint like the other agent calls: if you replace `omp`, replace the agent call in `retro.py` too.
 
 ## Config
 
@@ -278,6 +291,8 @@ and `JobHuntWatchdog` (every 120 minutes); `schtasks /Query /TN JobHuntDaily /FO
 macOS/Linux: run `python3 pipeline/daily.py` once a day and
 `python3 pipeline/watchdog.py --quiet` every couple of hours from cron or launchd, with `cwd` set to `pipeline/` and a `PATH` that includes `omp`,
 `node` and `gws`. These are not shipped and have never been run.
+
+`register-tasks.bat` also registers `JobHuntRetro` (daily 12:00), a backstop for a run that died before reaching digest. It takes the same lock non-blocking, exits if `daily.py` is still running, and exits unless `state/digest-<today>.md` exists. Normally `daily.py` runs retro in-process right after digest, so the timer does nothing.
 
 ## What is tuned to the author
 
@@ -373,7 +388,8 @@ Cloudflare Turnstile and CaptchaFox. Image and slider challenges are never solve
 | `pipeline/watchdog.py` | silence detector |
 | `pipeline/*.bat`, `*.vbs` | Windows launchers and Task Scheduler registration |
 | `pipeline/lib/` | `state.py` (config, SQLite, helpers), `notify.py`, `captcha.py` |
-| `pipeline/prompts/` | the two agent contracts |
+| `pipeline/prompts/` | the agent contracts (qualify, apply, retro) |
+| `pipeline/retro.py`, `lib/retro_telemetry.py`, `prompts/retro.md` | post-run self-healing loop (see [Post-run retro](#post-run-retro-self-healing)) |
 | `pipeline/omp-pipeline.yml` | omp model, retry and fallback settings for the pipeline's runs (the author's model pins) |
 | `pipeline/RUNBOOK.md` | the author's detailed ops notes (Windows-era) |
 | `resume_tailor.py`, `keyword_coverage.py` | resume tailoring engine and keyword-tier logic |
