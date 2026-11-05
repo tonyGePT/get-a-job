@@ -100,6 +100,19 @@ def pipeline(args):
     stage("verify receipts")
     script("verify.py")
 
+    # Proof-of-work artifacts: optional, config-gated (pow.enabled + pow.daily, both default
+    # false). Generation runs after verify so only CONFIRMED applications are eligible, and
+    # before the trace stages so an artifact exists by the time a draft does. The stage itself
+    # is capped (pow.max_per_day) and non-fatal; it never publishes or attaches.
+    pow_on = bool((S.CONFIG.get("pow") or {}).get("enabled")) and \
+        bool((S.CONFIG.get("pow") or {}).get("daily")) and not args.no_pow
+    if pow_on:
+        log("pow: enabled by config (pow.enabled + pow.daily); generation is capped at %s/day, "
+            "costs one metered omp pass per artifact and never publishes or attaches"
+            % ((S.CONFIG.get("pow") or {}).get("max_per_day", 1)))
+        stage("pow generate")
+        script("pow.py", "daily", required=False, label="pow generate")
+
     # Optional private extension: runs only if pipeline/trace.py exists AND config.json has a `tracehire` block.
     # The public repo does not ship trace.py; without it these stages are skipped (one log line).
     has_trace = os.path.exists(os.path.join(ROOT, "trace.py")) and bool(S.CONFIG.get("tracehire"))
@@ -113,6 +126,12 @@ def pipeline(args):
         # one retry pass for transient failures (cost-capped inside the extension)
         stage("trace retry")
         script("trace.py", "retry", required=False, label="trace retry")
+
+    # Reconciliation is read-only here: it confirms each published page and lists attachments an
+    # operator can still make, but a scheduled run must never publish or edit a draft.
+    if pow_on:
+        stage("pow reconcile")
+        script("pow.py", "reconcile", "--readonly", required=False, label="pow reconcile")
 
     stage("digest")
     script("digest.py")
@@ -133,6 +152,7 @@ def main():
     ap.add_argument("--days", type=int)
     ap.add_argument("--no-apply", action="store_true")
     ap.add_argument("--no-trace", action="store_true")
+    ap.add_argument("--no-pow", action="store_true")
     ap.add_argument("--discover-only", action="store_true")
     args = ap.parse_args()
 

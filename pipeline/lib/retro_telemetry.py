@@ -23,6 +23,7 @@ import time
 from datetime import datetime, timedelta, timezone
 
 import state as S
+import pow_telemetry as P
 
 SESSIONS = os.path.expanduser("~/.omp/agent/sessions")
 
@@ -695,6 +696,44 @@ def findings(f, kpi, usage, log, apply_out, verify, trace, skip, hygiene, durati
 
 
 # ---------------------------------------------------------------------------
+# PoW attribution (descriptive evidence, never a change proposal or a KPI)
+# ---------------------------------------------------------------------------
+
+def pow_snapshot(conn, day=None, days=30, horizon_days=14):
+    """PoW counts for the brief: artifacts, evidence-backed sends, outcomes, unknowns.
+
+    Deliberately descriptive. It is not a key of `kpi`, so the grader can never optimise a
+    handful of sends, and the PoW modules are not retro-writable. Wrapped broadly on purpose:
+    a broken attribution table must never cost the reviewer its run.
+    """
+    day = day or S.TODAY
+    try:
+        if not P.tables_present(conn):
+            return {"available": False, "reason": "no pow_artifacts/pow_events tables yet"}
+        snap = P.snapshot(conn, days=days, horizon_days=horizon_days)
+        snap["day"] = day
+        # pow_events.occurred_at is UTC; the pipeline's day is local, so convert the local
+        # calendar day to its UTC bounds instead of comparing date strings.
+        day_start = datetime.strptime(day, "%Y-%m-%d").astimezone()
+        day_end = day_start + timedelta(days=1)
+        today_events = {}
+        for row in conn.execute("SELECT kind, occurred_at FROM pow_events"):
+            ts = P.parse_ts(row["occurred_at"])
+            if ts is not None and day_start <= ts < day_end:
+                today_events[row["kind"]] = today_events.get(row["kind"], 0) + 1
+        created_today = 0
+        for row in conn.execute("SELECT created_at FROM pow_artifacts"):
+            ts = P.parse_ts(row["created_at"])
+            if ts is not None and day_start <= ts < day_end:
+                created_today += 1
+        snap["today"] = {"artifacts_created": created_today, "events": today_events,
+                         "note": "local calendar day %s" % day}
+        return snap
+    except Exception as e:          # attribution is never worth losing the night's review
+        return {"available": False, "reason": "%s: %s" % (type(e).__name__, e)}
+
+
+# ---------------------------------------------------------------------------
 # entry point
 # ---------------------------------------------------------------------------
 
@@ -733,6 +772,7 @@ def collect(day=None):
                       "files": usage["files"]},
             "findings": found,
             "kpi_directions": KPI_DIRECTION,
+            "pow": pow_snapshot(conn, day),
             "history": history_days(conn, 30),
             "open_actions": open_actions(conn),
             "repeated": recent_promotions(conn),
@@ -847,6 +887,9 @@ def render_markdown(packet, report=None):
              ", ".join("%s %d" % (a, b) for a, b in packet["trace"]["status"].items()))
     for e in packet["trace"]["errors"]:
         L.append("- %s — %s" % (e.get("company"), e.get("error")))
+    L.append("")
+    L.append(P.render_markdown(packet.get("pow"),
+                               heading="PoW attribution (descriptive only)").rstrip())
     if u.get("top_workers"):
         L.append("")
         L.append("## Worker cost detail (call volume is the loop signal)")

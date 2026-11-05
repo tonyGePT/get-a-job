@@ -66,7 +66,11 @@ RETRO_WRITABLE = (
 )
 # Never writable, whatever the agent claims: candidate facts, standing answers and state.
 RETRO_FORBIDDEN = ("profile/", "state/", "config.json", "resume_", "blitz_answers",
-                   "resume_routing_context", "discord_", "trace.py")
+                   "resume_routing_context", "discord_", "trace.py",
+                   # PoW: the artifact generator is a safety gate (validation, privacy,
+                   # execution consent) and the telemetry must never become a self-optimisation
+                   # target. "pow" covers pow.py, pow_metrics.py, lib/pow_*.py, prompts/pow*.md.
+                   "pow")
 
 DATA_KINDS = ("blocklist", "discover_regex", "ats_hint")
 CODE_KINDS = ("code", "prompt", "config")

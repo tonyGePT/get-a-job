@@ -45,6 +45,18 @@
     "grace_runs": 2,
     "max_changes_per_run": 6
   },
+  "pow": {
+    "enabled": false,
+    "daily": false,
+    "publish_enabled": false,
+    "attach_enabled": false,
+    "max_per_day": 1,
+    "agent_budget_usd": 2.0,
+    "exec_timeout_seconds": 60,
+    "window_days": 7,
+    "signal_window_days": 30,
+    "treg_budget_usd": 0.75
+  },
   "gws": {
     "node": "C:/Program Files/nodejs/node.exe",
     "cli": "C:/path/to/node_modules/@googleworkspace/cli/run-gws.js"

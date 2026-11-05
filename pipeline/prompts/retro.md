@@ -17,6 +17,9 @@ standing goal is: equal or better outcomes for fewer tokens, every day, compound
   `findings` (facts Python proved), `history` (past retro runs and their KPIs), and any changes
   awaiting grading. It is one page. **Read it once, in full, and trust its numbers.** This is
   the only input you need for the analysis.
+- The brief's `## PoW attribution (descriptive only)` section: artifact, evidence-backed send,
+  reply, cohort and latency counts from `lib/pow_telemetry.py`. Read it for context, but it is
+  not a metric to move (see the hard rules).
 - `state/logs/<today>.log` — read a narrow line range only if a specific finding needs the
   exact text. Never read the whole log.
 - `state/retro-<yesterday>-review.md` — yesterday's review, for continuity. Skip if absent.
@@ -70,6 +73,14 @@ from the brief, say so in the report instead of digging for it.
   outcome. A rejected change costs nothing; a wrong filter loses real applications.
 - **No duplicate work.** If `open_actions` already covers a finding, say so and propose nothing
   for it. If an action was reverted, do not propose the same change again.
+- **PoW attribution is descriptive, never a target.** `pow` sits outside `kpi` on purpose: it is
+  a handful of artifacts with a multi-week observation window. Never propose a change that
+  optimises reply/interview/offer counts, never treat a Gmail draft or a published URL as a send
+  (a send is credited only when the operator attests the message actually sent contained the
+  artifact URL), and never target `pow.py`, `pow_metrics.py` or `lib/pow_telemetry.py` (not
+  writable, and the counts are not causal). If something is structurally broken (every artifact
+  stuck with a draft and no send, a cohort with no observation window), say it under **For a
+  human**.
 - **Do not touch** `profile/`, `config.json`, `state/`, `trace.py`, or any file not in the
   proposal schema's allowed targets.
 

@@ -184,6 +184,8 @@ the author's Windows ops log (`C:/` paths, Task Scheduler, dated incidents): **w
 | extension | `trace.py` (private, not published) | optional post-verify stage; skipped when the file is absent | `state.db` |
 | digest | `digest.py` | one markdown summary, optionally posted to Discord | `state/digest-<date>.md` |
 | retro | `retro.py` (after digest, in-process) | telemetry, one review agent pass, gated and revertible self-healing changes | `state/retro-<date>.md`, `state.db` |
+| pow generate | `pow.py daily` (after verify, before the extension; off by default) | one grounded proof-of-work artifact per **confirmed** application, validated by Python | `state/pow/artifacts/*.json`, `pow_artifacts` |
+| pow reconcile | `pow.py reconcile --readonly` (after the extension; off by default) | confirms published pages, lists artifacts whose draft can still take the line | stdout only |
 
 `state/state.db` (SQLite) is the source of truth. `python pipeline/ledger.py check|list|add|outreach|lead|resume-change`
 reads and appends to it, including applications you made by hand. A day with zero candidates still runs verify, trace and
@@ -194,13 +196,165 @@ timeouts**: a hung agent blocks that day's run until you kill it.
 
 After digest, `daily.py` runs `retro.py --in-process` (non-fatal, `required=False`). Python computes the day's telemetry (funnel, per-stage tokens and cost, skip reasons, apply outcomes, stage durations) into `state/retro-<date>-brief.md`. One `omp -p` pass with `prompts/retro.md` reads it and proposes changes. The agent edits nothing itself: `retro.py` owns every mutation.
 
-- **Allowlist.** Changes may touch only files in `RETRO_WRITABLE`. `RETRO_FORBIDDEN` blocks `profile/`, `config.json`, `state/`, `trace.py`, resume files and answer files. Code and prompt changes are unified diffs, applied with `difflib` and then `py_compile`-checked (the file and every module importing it) or prompt-section-checked.
+- **Allowlist.** Changes may touch only files in `RETRO_WRITABLE`. `RETRO_FORBIDDEN` blocks `profile/`, `config.json`, `state/`, `trace.py`, every `pow*` file (artifact generator, prompts and telemetry), resume files and answer files. Code and prompt changes are unified diffs, applied with `difflib` and then `py_compile`-checked (the file and every module importing it) or prompt-section-checked.
 - **Data-only changes** (blocklist, discover regexes, ATS hints) are merged by Python into `state/blocklist.json`, `state/discover-overrides.json` and `state/ats-hints.json`. `discover.py` and `prompts/apply.md` read them; absent files are a no-op.
 - **Grading and revert.** Each change keeps a `.retro-bak` copy and is graded over the next 2 runs. A better KPI marks it verified; a KPI worse by 5% reverts it (backup, else `git checkout`, else drop the data entry). History is in the `retro_runs` and `retro_actions` tables of `state.db`.
 - **Retro cost is excluded from the pipeline KPI** (reported as `kpi.retro_cost_usd`), so the reviewer cannot inflate its own metric.
 - **Config.** The `retro` block in `config.example.json` (`enabled`, `agent_timeout_seconds`, `grace_runs`, ...) and an optional `notify.retro_webhook_file` for its own Discord digest.
 - **CLI.** `python pipeline/retro.py [--status|--dry-run|--no-agent|--backfill N|--digest|--day D]`.
 - **Porting.** It is an omp touchpoint like the other agent calls: if you replace `omp`, replace the agent call in `retro.py` too.
+
+## Proof-of-work artifacts (optional, off by default)
+
+After `verify`, `daily.py` can generate **one grounded artifact per confirmed application**: a short public page (a
+live account list with public buying-trigger evidence, a runnable connector repro, or a measured eval) that shows how
+the candidate thinks about that
+employer's problem. It is published by the [TraceHire](https://github.com/tonyGePT/tracehire) host and one line about
+it is appended to the existing outreach Gmail draft. **Nothing is sent by this pipeline.**
+
+```sh
+python pipeline/pow.py signals --titles "driver recruiter,fleet safety manager" --days 21 --countries US
+python pipeline/pow.py signals --titles "driver recruiter" --icp-keywords "trucking,freight" --sizes "51-200,201-500"
+python pipeline/pow.py signals --emit-sources       # free: the stored postings as sources entries
+python pipeline/pow.py signals --dry-run …          # free: print the request, call nothing
+python pipeline/pow.py generate --url <posting url>                 # one omp pass, metered
+python pipeline/pow.py generate --url <url> --candidate cand.json   # validate/store a candidate you wrote
+python pipeline/pow.py validate cand.json --url U --company C --role R --recipe R
+python pipeline/pow.py run <artifact_id>            # ai_eval: built-in evaluator
+python pipeline/pow.py run <artifact_id> --execute  # FDE: runs the artifact's own code (opt-in)
+python pipeline/pow.py publish <artifact_id>        # requires pow.publish_enabled
+python pipeline/pow.py attach <artifact_id> --run <run id>   # requires pow.attach_enabled
+python pipeline/pow.py revoke <artifact_id>
+python pipeline/pow.py status [--url U] [--json]
+python pipeline/pow.py reconcile [--readonly] [--dry-run]
+python pipeline/pow.py daily [--dry-run]            # what daily.py calls
+python pipeline/pow.py smoke                        # offline end-to-end: temp DB + local stub host
+```
+
+- **The `gtm_signal` artifact is a live account list, not a summary of the employer's website.** It is an
+  `accounts.csv` of real companies (account, buying trigger, posting URL, open-role count, posted date, detected ATS)
+  plus 3-5 findings read off those rows. Its rows may only come from `pow.py signals`, which is the **only** place
+  `pow.py` calls a provider: **`blitzapi.jobs.search`** (BlitzAPI `POST /v2/jobs/search` through treg's proxy,
+  `treg catalog get blitzapi.jobs.search`, verified 2026-10-16) at **$0.000495 per returned job row** (1 credit; an
+  empty page is free, `max_results` 1-50, cursor paginated). It authenticates with the same `~/.treg/config.json`
+  token `discover.py` uses and never logs it. Python enforces the budget: `pow.treg_budget_usd`
+  (default `$0.75`) per artifact, a per-call `X-Treg-Route-Max-Cost` header carrying what is left, an
+  `Idempotency-Key` per call, and a hard stop with a clear message when the budget is spent. There is
+  no call cap: a fetch run keeps paginating until the money or the cursor runs out. One call of 50 rows
+  at `max_results` 50 costs about `$0.025`. The spend is recorded on the artifact's `generated` event
+  as `details.cost_usd`/`details.treg_calls`, which is what `pow_metrics.py report` sums.
+- **Python writes the table; the model only chooses.** A model-written CSV fails for reasons that have
+  nothing to do with the finding (an unquoted comma in a company name, a hand-typed date, a `detail`
+  that contradicts the store, a retyped excerpt), so the candidate's `accounts.csv` is parsed leniently
+  for its **posting URLs only** and the table is rebuilt from `state/pow/signals/<token>.jsonl`: account
+  and trigger from the fetched posting, `evidence` the URL, `detail` the computed open-role count,
+  `posted` the fetched date, `ats` what the URL reveals, written by the `csv` module so every cell is
+  quoted. Row order is the candidate's (strongest signal first), one row per company, and the
+  `acct-<n>` sources are regenerated from the store — an account source no kept row refers to is pruned,
+  so a finding that cites one fails as an unknown source. A URL that is not in the store is refused.
+- **Depth, order and the hook are recipe rules, not model taste.** The prompt requires at least three
+  differently-aimed searches (title variants, a 7-day and a 21-day window, ICP filters) until the pool is
+  large enough to be selective, aiming at 12-20 kept accounts with 8 as the floor; `pow.py signals` prints
+  the pool (postings and distinct companies) and the spend after every call, so the agent can see the store
+  growing. Row order is the candidate's and Python keeps it: freshest first, then recognizable/large
+  operators, then multi-posting companies. `title`, `thesis` and `email_line` may name kept accounts
+  (case-insensitive); Python refuses a company-shaped name (`Logistics`, `Freight`, `Inc.`, …) that is not
+  the employer, an integration partner or a kept row, and refuses any fetched company the pack dropped.
+  Recency is a computed placeholder (`{freshest_days}`, `{n_recent_3d}`), a count that resolves to 0 or 1 in
+  the headline is refused ("1 accounts" is not a hook), a finding may not be a statement of absence ("none of
+  the URLs reveals…" belongs in `limitations`), and `{n_ats_match}` only exists from two matching rows up —
+  the postings are mostly LinkedIn URLs, so ATS is not the hook.
+- **Grounding is re-derived, not trusted.** Every fetch lands in `state/pow/signals/<token>.jsonl`; validation requires
+  each `accounts.csv` row's evidence URL to exist there, the account to be that posting's company, the trigger to use
+  the posting's own title words, the posted date to be the fetched date inside the window, the `ats` column to be what
+  the URL implies, and each `acct-<n>` source to quote the stored excerpt exactly. Since Python rebuilds all of that
+  from the store, those checks can only fail on a bug here, not on a model's typing; the check that still bites is the
+  URL, and an URL the fetch never returned is refused. At least 8 distinct accounts are required; below that the
+  candidate is recorded as an **abstention** with the count, and the fetch cost is recorded anyway. A `gtm_signal`
+  candidate without a signal store is refused outright. For a candidate you wrote by hand, `--signals FILE` (or
+  `JOBHUNT_POW_SIGNALS`) points validation at an existing store, which is how the offline smoke, a salvage run and any
+  re-validation work.
+- **Every pack carries its own method.** One finding must be the method: the trigger, the funnel
+  counts and the keywords that ran — `{n_fetched}` postings retrieved, `{n_companies}` distinct
+  companies, `{n_accounts}` kept, `{window_days}`-day window, and `{titles}` rendered from the fetch
+  log (never from the model). Python rejects a `gtm_signal` candidate with no such finding, so the
+  page reads as a rule the reader could re-run instead of a list that appeared.
+
+- **The model writes a candidate; Python decides.** The envelope (`posting_url`, `company`, `role`, `recipe`,
+  `artifact_id`, `generated_at`) is filled by `pow.py`, so an artifact cannot be mislabelled. A candidate that is not
+  supported by its sources is rejected with reasons and stored as `rejected` (never published). Recipes that cannot be
+  supported honestly **abstain** with a reason instead of padding a fake artifact.
+- **Validation is deterministic** (`validate_artifact`): required keys and caps, public `http(s)` sources only,
+  recomputed SHA-256 of every excerpt, every finding and result evidence id must resolve, `passed` results are only
+  allowed when `pow.py` executed them, and per-recipe minimums (GTM: `accounts.csv` + grounded rows + 3-5 findings +
+  one source per row; FDE: docs evidence + a runnable file + explicit execution status; AI eval: an executed `eval:`
+  result). Headline numbers are **placeholders** (`{n_accounts}`, `{n_multi}`, `{window_days}`,
+  `{freshest_days}`, `{n_recent_3d}`, plus `{n_fetched}`, `{n_companies}`, `{titles}` and `{n_ats_match}`
+  where the recipe defines them): Python substitutes the counts it computed from the grounded rows, a bare
+  two-or-more-digit number in `title`, `thesis`, `email_line` or a finding claim is rejected, and so is a
+  placeholder that resolves to 0 or 1 in `title`, `thesis` or `email_line`. A 12-word run copied from the job
+  description or the resume is rejected, as are email addresses, phone numbers, credentials and local paths
+  (`scan_publish_safety`; the host re-checks and 422s on the same classes).
+- **Nothing model-written runs automatically.** `ai_eval` artifacts are executed by a built-in deterministic evaluator
+  (`pow.py __eval`, our code, isolated child process, bounded timeout) over a declarative `.json` spec: no model, no
+  network, no `pip`. An artifact's own code (`fde_integration`) runs only after an operator passes `--execute`, in a
+  scratch dir with a minimal environment and a timeout; otherwise results stay `not_run`.
+- **Publishing and attaching are separate, explicit, and config-gated** (`pow.publish_enabled`, `pow.attach_enabled`,
+  both default `false`). The daily stage generates only; `reconcile` runs read-only there. The host's content
+  identity is the canonical UTF-8 sorted-key JSON of the whole artifact, `artifact_id` included, and that is what
+  `pow.py` sends as `dedupe_key`; an identical re-post dedupes onto the existing page, a regenerated artifact (new id)
+  is a new page. A host-returned sha256 that is missing or differs from that
+  `dedupe_key` makes the publish fail nonzero: the row keeps its previous status (so it stays unattachable), the remote
+  page is reported as an uncertain external effect and is never deleted automatically. Attach never edits anything but the artifact
+  line, and the host refuses sent drafts, unrelated postings and duplicate drafts.
+- **Caps and bounds are dollar budgets.** `pow.enabled` + `pow.daily` gate the stage (both default `false`, so no
+  implicit omp spend); `pow.max_per_day` caps generations per day; `pow.agent_budget_usd` (default `2.00`) caps one omp
+  pass through `omp --max-cost`, where print mode exits 3 at the cap and `pow.py` then validates whatever candidate the
+  agent had written; `pow.treg_budget_usd` (default `0.75`) caps the signal fetch, which has no call cap at all;
+  `pow.window_days` (default 7) limits which confirmed applications are eligible; `pow.signal_window_days` (default 30)
+  is the "posted within" window for a `gtm_signal` fetch and its validation; a non-blocking `state/pow/.lock` prevents
+  two agent passes at once. Two timeouts remain, and neither is a job limit: `pow.exec_timeout_seconds` bounds one
+  evaluator/harness child process, which costs no money and would otherwise hold the pipeline `.lock` from a runaway
+  loop, and the HTTP socket timeout on treg/host requests turns a dead connection into an error instead of a hang.
+- **State.** `state/pow/artifacts/<id>.json` (what publish sends), plus `state/pow/candidates/`, `state/pow/rejected/`,
+  `state/pow/tmp/`, and `state/pow/signals/<token>.jsonl` + `<token>.meta.json` (every fetched posting, and the
+  per-call fetch ledger that carries the spend). `state/pow/task.json` is the current pass' brief: recipe, target,
+  `signals_token`, `signals_path`, the treg and agent budgets, and `candidate_path`. Rows live in the additive `pow_artifacts` and
+  `pow_events` tables of `state.db`; `pow_events` is immutable attribution evidence, and `retro.py` may never edit
+  `pow*` files (`RETRO_FORBIDDEN`).
+
+### Attribution (pow_metrics.py)
+
+Reads `state/state.db` only; never contacts a provider, never reads Gmail, never sends mail.
+
+```sh
+python pipeline/pow_metrics.py record --kind sent --artifact-id <id> --sent-artifact-url <artifact url> --evidence-ref gmail:<message id>
+python pipeline/pow_metrics.py report [--days 30] [--horizon-days 14] [--cohort C] [--json] [--details]
+python pipeline/pow_metrics.py status [--limit 50]
+python pipeline/pow_metrics.py pending [--days 3650]
+```
+
+`record` is the only writer. The five outcome kinds (`sent`, `reply`, `positive_reply`, `interview`, `offer`) require
+an external evidence reference (message id, receipt subject, sheet row); a Gmail draft id and the artifact's own
+published URL are rejected as evidence. A `sent` credits an artifact only when `--sent-artifact-url` exactly matches
+that artifact's stored `published_url` (trailing slash aside) **and** the operator attests that the message actually
+sent carried that link, together with the real sent-message evidence; a `published` or `attached` event is not proof of
+the message's content. Every other send is stored as an unverified control send (`artifact_id` NULL,
+`details.pow_unverified` + `unverified_reason`) and never inflates the artifact's numbers. `--cohort` is accepted only
+on `generated`/`published`/`attached`; outcome events inherit it and cannot relabel it. `pow.py` uses the ISO week of
+creation (`2026-W45`) as that batch label, so cohort and recipe stay separate dimensions. Exact attribution uses `pow_store.url_key`, preserving identifying query parameters while dropping `utm_*`, fragments and trailing slashes; `details.posting_url` retains the source URL for audit. Query-distinct postings are not merged. There is no open/read tracking or Gmail reconciliation. `pending` prints the real publish command and a human-operated sent record command.
+Outcomes are measured only from a sent event's timestamp through the configured horizon. Late outcomes are shown separately, not included in the rate or latency; rates use matured sends and separately show censored, pending and unsent counts. Reports are descriptive, not causal.
+
+`pow.py smoke` is the offline proof of all of this: a temp state dir, a local stub of the four host routes, a fixture
+`treg` response ingested by `signals`, the built-in evaluator, and the privacy/execution/grounding refusals — no agent
+pass, no paid call, no external network. It asserts the positive path (grounded rows pass, placeholders resolve to the
+computed counts, a hand-crafted `accounts.csv` is rebuilt cell by cell with proper quoting, a title names kept accounts
+and states the computed recency, the candidate's row order is preserved) and the negative ones (a row absent from the
+fetch, an invented headline number, a count that resolves to 0 or 1 in the headline, a finding that states an absence, a
+company-shaped name that is not a kept row, a fetched company the pack dropped, `{n_ats_match}` with fewer than two
+matches, fewer than 8 accounts → abstention, a spend budget that stops the fetch, a finding that cites a pruned account
+source). It also asserts that one omp pass is built with `--max-cost <pow.agent_budget_usd>` and no timeout, and that
+`signals` prints the pool and the spend after every call, against a mocked subprocess and fixture responses.
 
 ## Config
 
@@ -218,6 +372,11 @@ After digest, `daily.py` runs `retro.py --in-process` (non-fatal, `required=Fals
 | `notify.email` | **your** mailbox address; mail from yourself is excluded when matching receipts |
 | `notify.discord_*` | optional; without them the digest is only the local file |
 | `gws.node`, `gws.cli` | absolute path to `node` and to `@googleworkspace/cli/run-gws.js`. The author launches gws as `node run-gws.js` because the Windows `.cmd` shim mangles JSON arguments. On macOS/Linux change `verify.py` to call `gws` directly |
+| `pow.enabled`, `pow.daily` | **both default `false`.** The after-verify generation stage runs only when both are true, so a fresh config never spends an agent pass or creates a public page |
+| `pow.publish_enabled`, `pow.attach_enabled` | **default `false`.** `pow.py publish` / `attach` refuse without them, even when an explicit artifact id is given; the scheduled run never calls either |
+| `pow.max_per_day`, `pow.agent_budget_usd`, `pow.exec_timeout_seconds` | generation cap per local day (default 1), dollar cap on one omp pass (default 2.00, passed as `omp --max-cost`; exit 3 means the cap was reached and the candidate on disk is validated anyway), hard bound on one evaluator/harness run (60 s — a local child process costs nothing and a runaway loop would hold the pipeline `.lock`) |
+| `pow.window_days`, `pow.signal_window_days` | how recent a confirmed application must be to get an artifact (default 7), and the "posted within N days" window for a `gtm_signal` posting fetch and its validation (default 30) |
+| `pow.treg_budget_usd` | the only bound on the `gtm_signal` signal fetch per artifact: dollars (default 0.75). There is no call cap — a run keeps paginating until the money or the cursor runs out. Python stops and says so when the budget is spent, and records the real spend on the artifact's `generated` event |
 
 Set `JOBHUNT_STATE=<dir>` to run any stage against a copy of `state/`.
 
@@ -376,6 +535,10 @@ Cloudflare Turnstile and CaptchaFox. Image and slider challenges are never solve
 - With no timeouts, a stuck agent process (`omp` or your replacement) blocks the next day's run (the lock stays held). Kill the stuck process; `watchdog.py` tells you.
 - Model providers sometimes congest; as shipped `omp-pipeline.yml` configures retries with exponential backoff and an orchestrator fallback model. A different harness needs the equivalent in its own config.
 - Never treat the agent's claim of success as proof. `verify.py` reading a confirmation email is the ground truth, and the digest separates `APPLIED` from `UNVERIFIED`.
+- **PoW artifacts need the private host.** Generation, validation and the built-in evaluator work offline, but `publish`/`attach`/`revoke`/`reconcile` need the TraceHire worker (`tracehire.base`) and its API key; the include `pow.py smoke` stub is the only offline publish path.
+- **`pow.py run --execute` runs model-written code.** It is opt-in per artifact, in a scratch dir with a minimal environment and a timeout, but there is no network isolation on the host: run only artifacts you have read.
+- **Attach never creates mail.** It appends one line to an existing, unsent Gmail draft from a run on the same posting; with no draft (or a sent one) it refuses and says why.
+- **Two URL identities on purpose.** `pow_artifacts.url_key` uses the host's posting identity (`lib/pow_store.url_key`): fragment, trailing slashes and `utm_*` params dropped, every other query parameter kept in order, host lowercased, path case kept — scheme-less locally, while the host's returned `url_key` also keeps `https://`, so compare local keys only with local keys. The stored `posting_url` is the exact URL — query tokens included — because the host matches attach on it. Do not "clean" the exact URL, and do not swap in the pipeline's coarser `S.norm_url` for PoW identity.
 - `state/` contains job descriptions, evidence screenshots, receipts and possibly passwords. The allowlist `.gitignore` keeps it out of git; do not widen it.
 
 ## Repository map
@@ -390,6 +553,10 @@ Cloudflare Turnstile and CaptchaFox. Image and slider challenges are never solve
 | `pipeline/lib/` | `state.py` (config, SQLite, helpers), `notify.py`, `captcha.py` |
 | `pipeline/prompts/` | the agent contracts (qualify, apply, retro) |
 | `pipeline/retro.py`, `lib/retro_telemetry.py`, `prompts/retro.md` | post-run self-healing loop (see [Post-run retro](#post-run-retro-self-healing)) |
+| `pipeline/pow.py` | proof-of-work artifacts: generate (one bounded `omp` pass), deterministic validation, built-in evaluator, publish/attach/revoke/status/reconcile, offline `smoke` |
+| `pipeline/lib/pow_store.py` | the additive `pow_artifacts` / `pow_events` DDL, atomic files under `state/pow/`, canonical SHA-256 |
+| `pipeline/pow_metrics.py`, `lib/pow_telemetry.py` | event recording and the attribution report (read-only over `state.db`, never sends mail) |
+| `pipeline/prompts/pow.md`, `prompts/pow-<recipe>.md` | the agent contract and the three recipe contracts (GTM signal, FDE integration, AI eval) |
 | `pipeline/omp-pipeline.yml` | omp model, retry and fallback settings for the pipeline's runs (the author's model pins) |
 | `pipeline/RUNBOOK.md` | the author's detailed ops notes (Windows-era) |
 | `resume_tailor.py`, `keyword_coverage.py` | resume tailoring engine and keyword-tier logic |

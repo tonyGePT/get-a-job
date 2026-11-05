@@ -70,6 +70,20 @@ C:/tmp/jobharness/pipeline/
                        skip reasons, apply outcomes, stage durations, hygiene, findings. Python
                        computes every number; the agent never parses raw logs or transcripts.
   prompts/retro.md     agent contract: read the packet, propose JSON changes, edit nothing.
+  pow.py               proof-of-work artifacts: generate (one bounded omp pass) -> deterministic
+                       validation -> store; signals (the only paid call: postings for a gtm_signal
+                       artifact, budget-capped, stored under state/pow/signals/); run (built-in
+                       ai_eval evaluator, or --execute for the artifact's own code);
+                       publish/attach/revoke/status/reconcile; `smoke` is the offline end-to-end
+                       scenario (temp DB + local stub host + a fixture treg response, no paid call).
+  lib/pow_store.py     the additive pow_artifacts / pow_events DDL (single owner), atomic files
+                       under state/pow/ (artifacts, candidates, refused, exec scratch, fetched
+                       signals), canonical JSON SHA-256 = the dedupe key.
+  pow_metrics.py       attribution CLI (record|report|status|pending) over pow_events; reads
+  lib/pow_telemetry.py state.db only, never sends mail, never enters the retro KPI dict.
+  prompts/pow.md       agent contract for one artifact candidate (envelope is Python's, evidence
+  prompts/pow-*.md     is the agent's); one recipe section per recipe (gtm_signal, fde_integration,
+                       ai_eval), each with its own minimums and abstention rules.
   lib/notify.py        Discord: `captcha --key K` (called live by the apply agent for CAPTCHAs it could NOT
                        solve), `scan` (after apply, deduped via state/discord-sent.json), `test`,
                        `retro` (stdin → the retro webhook). Bot token in
@@ -91,6 +105,12 @@ C:/tmp/jobharness/pipeline/
     digest-<date>.md, heartbeat.json, logs/<date>.log
     retro-<date>.md, retro-<date>-evidence.json   the troubleshooter's report and evidence packet
     retro-<date>-proposals.json   the agent's machine-readable proposals (rejected or applied)
+    pow/artifacts/<id>.json       accepted PoW envelopes: exactly what publish sends
+    pow/candidates/, pow/rejected/, pow/tmp/   raw agent candidates, refused candidates, exec scratch
+    pow/signals/<token>.jsonl     every posting `pow.py signals` fetched for one artifact (the only
+    pow/signals/<token>.meta.json rows a gtm_signal artifact may cite) and its per-call spend ledger
+    pow/task.json                 the current agent pass: recipe, target, signals_token, signals_path,
+                                  fetch caps and the one file the agent may write
     discover-overrides.json, ats-hints.json   optional rules grown by retro.py; absent = no-op
     ledger.json, ledger.json.bak-<date>   DEAD, imported 2026-10-28 into state.db
 ```
@@ -107,6 +127,8 @@ C:/tmp/jobharness/pipeline/
 | `outreach`, `resume_changes`, `log_notes` | outreach draft/send, resume edit, free-text note from the old log | one-time import, then `ledger.py outreach add` / `resume-change add` |
 | `retro_runs` | one post-run review: KPIs, finding count, agent tokens/cost | retro.py |
 | `retro_actions` | one self-healing change: target, patch, metric, baseline, grade, outcome | retro.py |
+| `pow_artifacts` | one PoW artifact (abstained/rejected rows included, with the reason) | pow.py |
+| `pow_events` | one attribution event: generated/published/attached/revoked/blocked context, or a recorded outcome | pow.py, pow_metrics.py |
 
 Every write is one row in one transaction. Nothing holds a whole-state copy, so a
 manual command running during a long poll can no longer be
@@ -122,6 +144,22 @@ python C:/tmp/jobharness/pipeline/daily.py --days 7         # override the 3-day
 python ledger.py check --company C --title T [--url U]   # duplicate review (exit 1 = prior record found)
 python ledger.py add --company C --title T --url U --action applied|unapplied|skipped|escalated --notes N
 python ledger.py list --days 7                  # recent history rows; also: outreach, resume-change
+python C:/tmp/jobharness/pipeline/pow.py generate --url U    # one PoW artifact (metered omp pass)
+python C:/tmp/jobharness/pipeline/pow.py generate --url U --candidate FILE   # validate/store only
+python C:/tmp/jobharness/pipeline/pow.py signals --titles "driver recruiter,fleet safety manager" --days 21 --countries US
+python C:/tmp/jobharness/pipeline/pow.py signals --titles "driver recruiter" --icp-keywords "trucking,freight" --sizes "51-200,201-500"
+python C:/tmp/jobharness/pipeline/pow.py signals --emit-sources   # stored postings as sources entries (free; acct sources are written by Python anyway)
+python C:/tmp/jobharness/pipeline/pow.py signals --dry-run --titles T --days N   # free: the request only
+python C:/tmp/jobharness/pipeline/pow.py validate FILE --url U --company C --role R --recipe R
+python C:/tmp/jobharness/pipeline/pow.py generate --url U --candidate FILE --signals FILE  # hand-written candidate
+                                       # (--signals / JOBHUNT_POW_SIGNALS = the store it must be grounded in)
+python C:/tmp/jobharness/pipeline/pow.py run <artifact_id>   # ai_eval: built-in evaluator
+python C:/tmp/jobharness/pipeline/pow.py run <artifact_id> --execute         # FDE code, opt-in
+python C:/tmp/jobharness/pipeline/pow.py publish <artifact_id>               # needs pow.publish_enabled
+python C:/tmp/jobharness/pipeline/pow.py attach <artifact_id> --run <run id> # needs pow.attach_enabled
+python C:/tmp/jobharness/pipeline/pow.py status | reconcile --readonly | revoke <artifact_id>
+python C:/tmp/jobharness/pipeline/pow.py smoke               # offline, no agent, no paid call
+python C:/tmp/jobharness/pipeline/pow_metrics.py report --days 30            # attribution counts
 python C:/tmp/jobharness/pipeline/retro.py                  # review + self-heal (also runs inside daily.py)
 python C:/tmp/jobharness/pipeline/retro.py --status         # KPI table + pending changes
 python C:/tmp/jobharness/pipeline/retro.py --dry-run        # collect + report only, no agent, no changes
@@ -207,6 +245,64 @@ A paused readout: `Last Result 0` is success; `JobHuntWatchdog` writes
   same `.lock` non-blocking and exits if the daily run is still alive.
 - **Retro cannot invent candidate facts.** Its prompt forbids `blitz_answers.md`, `resume_*`, `profile/`; escalations
   that need a human are reported as "For a human", never auto-answered.
+- **PoW generation is doubly gated, and its limit is a dollar budget.** The daily stage runs only when `pow.enabled`
+  *and* `pow.daily` are true (both default false), so a fresh config spends nothing; `pow.max_per_day` (default 1)
+  caps omp passes per local day; `pow.agent_budget_usd` (default `$2.00`) is passed to `omp` as `--max-cost`, so the
+  pass stops sending model requests when that spend is reached and print mode exits 3 — `pow.py` then validates
+  whatever candidate the agent had written, and only a failed pass (any other nonzero code) is recorded as rejected;
+  `state/pow/.lock` stops two passes at once. There is no wall-clock limit on the agent. Only applications with
+  `status='submitted' AND confirmed=1` are eligible — nothing is inferred from a draft or a skipped stage.
+- **PoW's `gtm_signal` rows come from a paid fetch, and Python owns the money.** `pow.py signals` is the only place
+  `pow.py` calls a provider: `blitzapi.jobs.search` (BlitzAPI `POST /v2/jobs/search` via treg's proxy) at
+  **$0.000495 per returned job row** (`max_results` 1-50, cursor paginated, an empty page is free). The token is the
+  one `discover.py` uses (`~/.treg/config.json`) and is never printed. Per artifact, `pow.treg_budget_usd` (0.75) is
+  enforced from the per-call ledger in `state/pow/signals/<token>.meta.json`; there is no call cap, so a fetch keeps
+  paginating until the budget or the cursor runs out. Every call carries `Idempotency-Key` and
+  `X-Treg-Route-Max-Cost` (what is left), and an exhausted budget stops the command with a message instead of another
+  charge. One call of 50 rows ≈ $0.025. The spend lands on the artifact's `generated`
+  event (`details.cost_usd`, `details.treg_calls`) — or on the `blocked` event when the result is an abstention.
+- **PoW grounding is re-derived from the stored fetch, never from the model's memory — and Python authors the table.**
+  A `gtm_signal` candidate only chooses: its `accounts.csv` is parsed leniently for the posting URLs it names, then
+  every cell is rebuilt from this token's store — account and trigger from the fetched posting, `evidence` the URL,
+  `detail` the computed open-role count, `posted` the fetched date inside the window, `ats` what the URL reveals —
+  and written by the `csv` module, so a stray comma or a retyped date cannot reach the page. Row order is the
+  candidate's (strongest signal first), one row per company, and the `acct-<n>` sources are regenerated from the store
+  (an acct source no kept row refers to is pruned, and a finding citing one fails as an unknown source). An URL the
+  fetch never returned is refused. Headline figures are
+  placeholders (`{n_accounts}`, `{n_multi}`, `{window_days}`, `{freshest_days}`, `{n_recent_3d}`,
+  `{n_ats_match}`, and for the method finding `{n_fetched}`, `{n_companies}`, `{titles}`) substituted by Python from
+  the validated rows and the fetch ledger; a typed two-digit number in `title`/`thesis`/`email_line`/a claim is
+  refused, as is a pack with no METHOD finding (the one claim that states the trigger, the funnel and the keywords
+  that ran). Three more rules make the page worth opening rather than merely true. **Depth:** the prompt demands at
+  least three differently-aimed searches and 12-20 kept accounts (8 is the floor, else abstain), and `signals` prints
+  the pool and the spend after every call so the agent can see it grow. **The hook:** `title`/`thesis`/`email_line` may
+  name kept accounts, and Python refuses a company-shaped name (carrying a designator such as `Logistics`, `Freight`,
+  `Inc.`) that is not the employer, an integration partner or a kept row, plus any fetched company the pack dropped; a
+  placeholder that resolves to 0 or 1 in the headline is refused ("1 accounts" is not a hook); `{n_ats_match}` only
+  exists from two matching rows up, and the ATS is never the hook because the postings are mostly LinkedIn URLs.
+  **Findings are positive:** a claim that states an absence ("none of the URLs reveals…", "no partner was found") is
+  refused, and the prompt sends that material to `limitations`.
+  Below 8 grounded accounts the candidate becomes an **abstention** with the count, and a `gtm_signal` candidate with
+  no signal store is refused outright. A rejected candidate whose URLs and agent prose are sound can be re-run without
+  a new agent pass: `pow.py generate --url U --company C --role R --recipe gtm_signal --candidate <file> --signals
+  state/pow/signals/<token>.jsonl` still fails on unfetched URLs and invented numbers, but not on CSV formatting.
+- **PoW execution never runs model-written code automatically.** `ai_eval` is scored by the built-in deterministic
+  evaluator (`pow.py __eval`, our code, isolated child process, `pow.exec_timeout_seconds`) over a declarative JSON
+  spec (three baselines: keyword_classify, regex_extract, exact_match). An artifact's own code runs only with an
+  operator `--execute`, in `state/pow/tmp` with a minimal env and a timeout. There is no network isolation: read the
+  artifact before you execute it.
+- **PoW posting identity mirrors the host.** `lib/pow_store.url_key()` drops only the fragment, trailing slashes and
+  `utm_*` params; other query params (`gh_jid`, `id`, `s`, `ref`) are kept in order and the path keeps its case — the
+  pipeline's `S.norm_url` is *not* used for PoW artifacts, because it would fold two postings into one and make the
+  attach guard disagree with the host. `dedupe_key` is the canonical UTF-8 JSON hash of the whole artifact
+  (`artifact_id` included) and the host echoes it back; any difference is treated as a canonicalization bug.
+- **PoW publishing and attaching are separate operator commands.** `pow.publish_enabled` / `pow.attach_enabled` are
+  false by default; `daily.py` calls only `pow.py daily` (generate) and `pow.py reconcile --readonly`. Publish sends
+  `{artifact, dedupe_key}` where the key is the host's content identity (canonical sorted-key JSON of the whole
+  artifact, `artifact_id` included), so an identical re-post dedupes onto the same page; the returned `id` is the page owner and is what
+  attach/GET/DELETE use. The host echoes that same hash; a missing or
+  different value fails the publish (`rc 1`), leaves the row in its previous status so it cannot be attached, and
+  reports the remote page as an uncertain external effect instead of deleting it. Attach refuses when no local `runs` row matches the artifact's posting.
 
 ## When it escalates to you
 
@@ -215,6 +311,11 @@ token the form rejected twice), emailed verification codes, exact-salary demands
 wording, AI-attestation, mandatory cover letters, anonymous staffing reposts. Each has a
 `state/evidence/<key>.json` with the fields already filled, so re-doing one by
 hand is a copy-paste job.
+
+PoW additions to the same list: `pow.py attach` failures that the host refuses (no draft, draft already sent, draft
+carries attachments, posting URL mismatch) print the reason and leave the artifact `published`; append the line by
+hand only if the draft is sound. `pow.py status` also shows any abstained artifact with the agent's reason — an
+abstention is a decision, not a bug.
 
 ## Known gaps
 
@@ -225,10 +326,70 @@ hand is a copy-paste job.
 - Workday candidate accounts are created per employer; passwords are recorded in
   the evidence JSON.
 - BlitzAPI's `is_agency` flag is weak — the blocklist regex and the
-  "3+ roles in one window" board heuristic do most of the filtering.
+  "3+ roles in one window" board heuristic do most of the filtering. For PoW signals neither runs: `signals` passes
+  `company.is_agency: false` and narrows with `--icp-keywords`/`--sizes`, and the agent is told to drop staffing
+  agencies, boards and the employer's own competitors by hand before writing `accounts.csv`.
+- PoW signal postings are mostly LinkedIn URLs, so `ats` is often empty and `{n_ats_match}` is usually too small to
+  sell. The placeholder therefore only exists from two matching rows up (one match is refused as unavailable), the
+  prompt tells the agent not to mention ATS in the hook at all otherwise, and the `ats` column stays only as a table
+  column filled from the posting URL's host. A zero is honest, not a bug — it is just not the hook.
+- PoW publish/attach/revoke/reconcile need the private TraceHire worker and its key file; generation, validation and
+  the built-in evaluator are offline, and `pow.py smoke` covers the whole flow (including a fixture `treg` response)
+  against a local stub.
+- **Cross-language parity fixtures live in `archive/pow-fixtures-2026-11-04/`** (untracked): three accepted artifacts
+  plus `manifest.json` with bytes, canonical sha256, local and host `url_key`. They were validated against the host
+  validator offline (3/3) and are the post-deploy baseline: publish `artifact.json` and compare the returned
+  sha256/bytes to the manifest. Regenerate into a scratch state with
+  `JOBHUNT_STATE=<dir> python pow.py generate --url U --company C --role R --recipe R --candidate <file>`
+  (the candidate inputs are the `_*_candidate()` fixtures inside `pow.py`; the `gtm_signal` one needs the fixture
+  signal store, which `pow.py smoke` writes — regenerate it there or pass `--signals`). The archived `gtm_signal`
+  artifacts were baselined before the v2 account-list change, so their regeneration now differs by design:
+  re-baseline instead of investigating.
+  **Two checks, two questions — keep them separate.** (1) *Post-deploy, host:* publish the archived `artifact.json`
+  (input bytes pinned) and compare the returned sha256/bytes/`url_key` to the manifest — any mismatch is the deployed
+  build, because the input hash cannot have changed. (2) *Generator:* regenerate from the `_*_candidate()` fixtures and
+  compare to the manifest — any mismatch means `pow.py`/prompts/fixtures changed, so re-baseline instead of
+  investigating the host. Regeneration recovers the *reference values*; it is not a substitute for the pinned *input
+  file*, and merging the two checks makes a drift unattributable.
+  Caveat: this repo lives under `C:/tmp`, so the archive is a convenience copy, not durable storage — a broad `C:/tmp`
+  wipe or an image reset takes it. Copy it outside `C:/tmp` (e.g. the job-harness Drive folder) if it must survive the
+  machine.
+- The ai_eval baselines are deterministic smoke-level tools (keyword/regex/normalization), not model evaluations; the
+  artifact says so in `limitations`, and no provider is ever called by `pow.py`.
 
 ## State history
 
+- 2026-11-05 (v2.2): the `gtm_signal` recipe was made to produce something a GTM lead would click, after the first
+  live pack (8 accounts from one treg call) was valid but weak. The prompt now demands at least three
+  differently-aimed searches (title variants, a 7-day and a 21-day window, ICP filters), targets 12-20 kept accounts
+  with 8 as the floor, and gives a deterministic order (freshest first, then recognizable/large operators, then
+  multi-role companies — Python keeps the candidate's order). `pow.py signals` prints the pool (postings and distinct
+  companies) and the spend after every call. New computed placeholders `{freshest_days}` and `{n_recent_3d}` let a
+  headline state recency truthfully; a placeholder that resolves to 0 or 1 in `title`/`thesis`/`email_line` is
+  refused; `{n_ats_match}` now exists only from two matching rows up; a finding that states an absence is refused;
+  and a company-shaped name in `title`/`thesis` must be a kept row (Python also refuses a fetched company the pack
+  dropped). `prompts/pow-gtm_signal.md` gained a third "Python will not take on trust" rule in `prompts/pow.md`. No
+  table or column changed.
+- 2026-11-05 (v2.1): every job-level PoW limit is a dollar budget. `pow.agent_timeout_seconds` is gone: one omp pass
+  is capped by `omp --max-cost <pow.agent_budget_usd>` (default $2.00), whose print-mode exit 3 means "budget reached",
+  and `pow.py` then validates whatever candidate the agent had written. `pow.treg_max_calls` is gone as well:
+  `pow.treg_budget_usd` is the only bound on the signal fetch (the per-call row clamp, `X-Treg-Route-Max-Cost`, the
+  idempotency key and the spend ledger all stay). `pow.exec_timeout_seconds` and the HTTP socket timeout stay on
+  purpose, because a local child process costs no money and a dead connection must not hang the run.
+  `gtm_signal`'s `accounts.csv` and its `acct-<n>` sources are now authored by `pow.py` from the fetched store — the
+  candidate supplies the posting URLs and nothing else — so a quoting bug, a hand-typed date or a retyped excerpt can
+  no longer reject an otherwise sound pack. `state/pow/task.json` publishes `agent_budget_usd` in place of
+  `treg_max_calls`. No table or column changed.
+- 2026-11-04 (v2): `gtm_signal` became an account-list artifact. New `state/pow/signals/` (fetched postings + spend
+  ledger) and `state/pow/task.json` (adds `signals_token`, `signals_path`, the fetch caps). New `pow.py signals`
+  command and `pow.treg_budget_usd` / `pow.treg_max_calls` / `pow.signal_window_days` config keys (all defaulted in
+  code, so an existing `config.json` keeps working). No table or column changed: the fetch cost rides on the existing
+  `pow_events.details_json`. Artifacts generated before this date keep their stored bytes; a new `gtm_signal` candidate
+  needs a signal store to validate.
+- 2026-11-04: two additive tables, `pow_artifacts` and `pow_events` (`lib/pow_store.py` is the only DDL owner;
+  `pow_telemetry` imports `ensure_schema`), plus `state/pow/` for artifacts, candidates, refused candidates and
+  exec scratch. No existing table or column changed. `retro.py` now refuses to edit any `pow*` file, and no PoW
+  metric enters the retro KPI dict: attribution over a handful of sends must never become a self-optimisation target.
 - 2026-10-28: `state/ledger.json` was replaced by `state/state.db` (postings, runs,
   applications, receipts). The import was a one-shot script — it backed the ledger up
   to `ledger.json.bak-2026-10-28`, imported 33 postings, 13 runs, 6 verdicts and 7

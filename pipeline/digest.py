@@ -6,6 +6,10 @@ the same text to the Discord channel configured in lib/notify.py. No email.
 
 Decisions are grouped by their final outcome, most useful first and SKIPPED last, so the
 long tail can be scrolled past. Each row is: company, role, location, published salary.
+
+One extra header line reports PoW attribution counts (artifacts, evidence-backed sends,
+replies) from lib/pow_telemetry.py. It is read-only, never creates the PoW tables, and a
+missing or broken attribution table simply leaves the line out.
 """
 
 import json
@@ -17,6 +21,7 @@ from datetime import datetime, timezone
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "lib"))
 import state as S  # noqa: E402
 import notify  # noqa: E402
+import pow_telemetry as P  # noqa: E402
 
 # Display order of the final outcomes. SKIPPED is last on purpose.
 GROUPS = ("APPLIED", "UNVERIFIED", "NEEDS CODE", "FAILED", "ESCALATED", "QUEUED", "SKIPPED")
@@ -129,6 +134,12 @@ def build():
         runs = [dict(r) for r in S.runs(
             conn, "substr(COALESCE(started, ''), 1, 10)=? OR substr(COALESCE(finished, ''), 1, 10)=?",
             (day, day))]
+        # PoW attribution: counts over the last 30 days, read-only. A digest never creates the
+        # PoW tables, and a broken one must not cost the day's summary.
+        try:
+            pow_line = P.summary_line(P.snapshot(conn, days=30, horizon_days=14))
+        except Exception:
+            pow_line = None
     finally:
         conn.close()
 
@@ -147,6 +158,8 @@ def build():
     usage = agent_usage(day)
     if usage:
         L.append(usage)
+    if pow_line:
+        L.append(pow_line)
     if carried:
         L.append("_(%d earlier submission(s) re-verified, not new today)_" % len(carried))
 
