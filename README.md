@@ -1,4 +1,4 @@
-# job-harness
+# get-a-job
 
 A daily job-application pipeline: discover postings, have an LLM agent qualify them against **your** rules,
 tailor a keyword-verified resume per posting, let a browser agent submit the applications, check each one
